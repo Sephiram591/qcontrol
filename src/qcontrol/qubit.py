@@ -17,7 +17,6 @@ class ColorCenterQubit:
         optical_df =           0.3e9,
         optical_lifetime =     1/6e-9,           # Emitter lifetime
         mw_fc =                1.3e9,
-        t2_star =              1.6e-6,         # T2* relaxation time
         branching_ratio =      0.001,   # Branching ratio
         dark_count_rate =      10e3,
         coupling_efficiency =  0.005,
@@ -31,19 +30,12 @@ class ColorCenterQubit:
         lambda_DL =            None, # HEOM Bath coupling strength
         bath_temp =            1.3, # HEOM Bath temperature
         Nk =                   3, # HEOM Bath number of exponentials
-        max_depth =            3, # HEOM Solver maximum depth. NOTE- Should be larger than Nk
-
-        ####################################### Trajectory purity settings ############################
-        memory_tau=0, 
-        purity_decay_fn=gaussian_decay, 
-        purity_inverse_fn=inverse_gaussian_decay, 
-        memory_delta_fn=delta_exponential_decay
+        max_depth =            3, # HEOM Solver maximum depth. NOTE- Should be larger than N
     ):
         # System constants
         self.optical_fc = optical_fc
         self.optical_df = optical_df
         self.optical_lifetime = optical_lifetime
-        # self.t2_star = t2_star
         self.branching_ratio = branching_ratio
         self.dark_count_rate = dark_count_rate
         self.coupling_efficiency = coupling_efficiency
@@ -51,7 +43,6 @@ class ColorCenterQubit:
         self.non_radiative_factor = non_radiative_factor
         self.readout_settings = None
         self.sigmaz_noise_fn = sigmaz_noise_fn
-        self.t2_star = t2_star
 
         # Derived constants
         self.f0 = self.optical_fc - self.optical_df/2
@@ -63,26 +54,15 @@ class ColorCenterQubit:
         self.mw_fc = mw_fc
         self.w_mw = 2 * np.pi * self.mw_fc
 
-        self.current_dephasing_trajectory = np.array([0+0j, 0+0j, 0+0j])
-        self.current_forgotten_trajectory = 0
         
         ####################################### HEOM Settings #########################################
         self.bath_temp = bath_temp
         self.gamma_DL = gamma_DL
         self.lambda_DL = lambda_DL
-        # if not gamma_DL:
-        #     self.gamma_DL = 1/t2_star
-        # if not lambda_DL:
-        #     self.lambda_DL = self.gamma_DL*hbar/(2*kB*self.bath_temp*self.t2_star)
         self.Nk = Nk
         self.max_depth = max_depth
         self.psi0 = qt.basis(4, 0).proj()
         
-        ###################################### Trajectory Purity Settings #############################
-        self.memory_tau = memory_tau
-        self.purity_decay_fn = purity_decay_fn
-        self.purity_inverse_fn = purity_inverse_fn
-        self.memory_delta_fn = memory_delta_fn
 
     def _init_hamiltonian(self, include_excitation=True):
         # Basis states
@@ -100,6 +80,7 @@ class ColorCenterQubit:
             self.sig_g0e0 = self.g0 * self.e0.dag() + self.e0 * self.g0.dag()
             self.sig_g1e1 = self.g1 * self.e1.dag() + self.e1 * self.g1.dag()
             self.sig_g0g1 = self.g0 * self.g1.dag() + self.g1 * self.g0.dag()
+            self.sig_e0e1 = self.e0 * self.e1.dag() + self.e1 * self.e0.dag()
             self.sigma_z_g = self.g0*self.g0.dag() - self.g1*self.g1.dag()
 
             # If psi0 does not have e0 and e1, expand it to include them
@@ -125,12 +106,6 @@ class ColorCenterQubit:
             # If psi0 has e0 and e1, trace them out
             # Check if the Hilbert space is 4-dimensional (i.e., includes e0 and e1)
             if self.psi0.dims[0][0] == 4:
-                if self.memory_tau:
-                    dm_purity = self.psi0.purity()
-                    # Mix the purity of the density matrix with the purity of the dephasing trajectory
-                    total_purity = dm_purity * self.purity_decay_fn(self.current_forgotten_trajectory+np.linalg.norm(self.current_dephasing_trajectory))
-                    total_trajectory = self.purity_inverse_fn(total_purity)
-                    self.current_forgotten_trajectory = total_trajectory - np.linalg.norm(self.current_dephasing_trajectory)
                 M4 = self.psi0.full()         # 4×4 array
                 M2 = qt.Qobj(M4[:2, :2], dims=[[2],[2]])               # keep only rows 0–1 and cols 0–1
                 if self.gamma_DL:
@@ -161,16 +136,14 @@ class ColorCenterQubit:
             # J_approx = self.bath_env_approx.spectral_density(wlist)
 
 
-    def apply_pulse_sequence(self, tlist, pulse_dict, plot=False, use_coherence_trajectory=False, purity_downsampling=10, custom_options={}):
+    def apply_pulse_sequence(self, tlist, pulse_dict, plot=False, custom_options={}):
         """
         pulse_dict: {
             'optical': f(t) or array,
             'microwave': f(t) or array,
         }
         """
-        # Hamiltonian
         H = []
-        # H = [self.H0]
         if 'optical' in pulse_dict:
             self._init_hamiltonian(include_excitation=True)
             H.append([self.sig_g0e0, pulse_dict['optical']])
@@ -183,14 +156,10 @@ class ColorCenterQubit:
 
         if 'mw' in pulse_dict:
             H.append([self.sig_g0g1, pulse_dict['mw']])
+            if 'optical' in pulse_dict:
+                H.append([self.sig_e0e1, pulse_dict['mw']])
         if self.sigmaz_noise_fn is not None:
             sigmaz_noise = self.sigmaz_noise_fn(tlist)
-            # plt.figure(figsize=(8,4))
-            # plt.plot(tlist, sigmaz_noise)
-            # plt.xlabel("Time (us)")
-            # plt.ylabel("Noise")
-            # plt.tight_layout()
-            # plt.show()
             H.append([self.sigma_z_g, sigmaz_noise])
 
 
@@ -210,11 +179,6 @@ class ColorCenterQubit:
             result = qt.mesolve(H, self.psi0, tlist, c_ops=c_ops, e_ops=self.e_ops, options=options)
             self.psi0 = result.final_state
         
-        tlist_downsampled = tlist[::purity_downsampling]
-        # if self.memory_tau and use_coherence_trajectory:
-        #     coherence_history = analyze_state_purity(tlist_downsampled, result.states[::purity_downsampling], 1/self.t2_star, self.memory_tau, purity_decay_fn=self.purity_decay_fn, purity_inverse_fn=self.purity_inverse_fn, memory_delta_fn=self.memory_delta_fn, plot=False, f_rot=self.mw_fc)
-        # else:
-        #     coherence_history = None
         if plot:
             plt.figure(figsize=(8,4))
             plt.plot(tlist*1e6, result.expect[0], label='|g0>')
@@ -224,17 +188,12 @@ class ColorCenterQubit:
             if 'optical' in pulse_dict:
                 plt.plot(tlist*1e6, result.expect[4], label='|e0>')
                 plt.plot(tlist*1e6, result.expect[5], label='|e1>')
-
-            # if coherence_history:
-            #     plt.plot(tlist_downsampled*1e6, coherence_history['purity'], label='purity')
-            #     plt.plot(tlist_downsampled*1e6, self.purity_decay_fn(coherence_history['forgotten_trajectory']), label='maximum purity')
-
             plt.xlabel("Time (us)")
             plt.ylabel("Population")
             plt.legend()
             plt.tight_layout()
             plt.show()
-        return result, None
+        return result
 
     def process_result(self, result, bin_dt, bin_res, reps, use_dark_counts=True, cps=False):
         total_emitted = self.optical_lifetime * (1 - self.branching_ratio) *(result.expect[4] + result.expect[5])
