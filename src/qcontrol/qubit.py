@@ -21,7 +21,7 @@ class ColorCenterQubit:
         dark_count_rate =      10e3,
         coupling_efficiency =  0.005,
         debye_waller_factor =  0.7,
-        non_radiative_factor = 0.05,
+        quantum_efficiency = 0.05,
         
         sigmaz_noise_fn =     None,
 
@@ -31,6 +31,7 @@ class ColorCenterQubit:
         bath_temp =            1.3, # HEOM Bath temperature
         Nk =                   3, # HEOM Bath number of exponentials
         max_depth =            3, # HEOM Solver maximum depth. NOTE- Should be larger than N
+        psi0 = None,
     ):
         # System constants
         self.optical_fc = optical_fc
@@ -40,7 +41,7 @@ class ColorCenterQubit:
         self.dark_count_rate = dark_count_rate
         self.coupling_efficiency = coupling_efficiency
         self.debye_waller_factor = debye_waller_factor
-        self.non_radiative_factor = non_radiative_factor
+        self.quantum_efficiency = quantum_efficiency
         self.readout_settings = None
         self.sigmaz_noise_fn = sigmaz_noise_fn
 
@@ -61,7 +62,10 @@ class ColorCenterQubit:
         self.lambda_DL = lambda_DL
         self.Nk = Nk
         self.max_depth = max_depth
-        self.psi0 = qt.basis(4, 0).proj()
+        g0 = qt.basis(4, 0)
+        g1 = qt.basis(4, 1)
+        # print(type(0.5*(g0*g0.dag()+g1*g1.dag())))
+        self.psi0 = (0.5*(g0*g0.dag()+g1*g1.dag())) if psi0 is None else psi0 #.proj() # Fully mixed ground states
         
 
     def _init_hamiltonian(self, include_excitation=True):
@@ -94,10 +98,10 @@ class ColorCenterQubit:
             self.H0 = (self.w0-self.w_mw/2) * self.e0 * self.e0.dag() + (self.w1+self.w_mw/2) * self.e1 * self.e1.dag() + self.w_mw/2 * (self.g1 * self.g1.dag() - self.g0 * self.g0.dag())
 
             # Collapse operators
-            self.c_e0 = np.sqrt(self.optical_lifetime * (1 - self.branching_ratio)) * self.g0 * self.e0.dag()
-            self.c_e1 = np.sqrt(self.optical_lifetime * (1 - self.branching_ratio)) * self.g1 * self.e1.dag()
-            self.c_branching_e0 = np.sqrt(self.optical_lifetime * self.branching_ratio) * self.g1 * self.e0.dag()
-            self.c_branching_e1 = np.sqrt(self.optical_lifetime * self.branching_ratio) * self.g0 * self.e1.dag()
+            self.c_e0 = np.sqrt(1/self.optical_lifetime * (1 - self.branching_ratio)) * self.g0 * self.e0.dag()
+            self.c_e1 = np.sqrt(1/self.optical_lifetime * (1 - self.branching_ratio)) * self.g1 * self.e1.dag()
+            self.c_branching_e0 = np.sqrt(1/self.optical_lifetime * self.branching_ratio) * self.g1 * self.e0.dag()
+            self.c_branching_e1 = np.sqrt(1/self.optical_lifetime * self.branching_ratio) * self.g0 * self.e1.dag()
             self.c_ops = [self.c_e0, self.c_e1, self.c_branching_e0, self.c_branching_e1]
         else:
             # print("Reducing to 2-dimensional Hilbert space")
@@ -196,9 +200,9 @@ class ColorCenterQubit:
         return result
 
     def process_result(self, result, bin_dt, bin_res, reps, use_dark_counts=True, cps=False):
-        total_emitted = self.optical_lifetime * (1 - self.branching_ratio) *(result.expect[4] + result.expect[5])
-        zpl_photon_rate = total_emitted * self.coupling_efficiency * self.debye_waller_factor * self.non_radiative_factor
-        psb_photon_rate = total_emitted * self.coupling_efficiency * (1-self.debye_waller_factor) * self.non_radiative_factor
+        total_emitted = 1/self.optical_lifetime*(result.expect[4] + result.expect[5])
+        zpl_photon_rate = total_emitted * self.coupling_efficiency * self.debye_waller_factor * self.quantum_efficiency
+        psb_photon_rate = total_emitted * self.coupling_efficiency * (1-self.debye_waller_factor) * self.quantum_efficiency
         zpl_photon_rate = zpl_photon_rate[::bin_res]
         psb_photon_rate = psb_photon_rate[::bin_res]
         zpl_counts = zpl_photon_rate*reps*bin_dt

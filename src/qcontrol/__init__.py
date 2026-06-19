@@ -50,3 +50,4 @@ __website_url__ = "https://camacholab.byu.edu/"
 
 from qcontrol.qubit import ColorCenterQubit
 from qcontrol.tools import *
+from qcontrol.snv120 import hamiltonian, parameters, hamiltonian_jax
