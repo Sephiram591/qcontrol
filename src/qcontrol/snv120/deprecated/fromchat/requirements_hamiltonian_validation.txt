@@ -1,0 +1,5 @@
+jax
+jaxquantum
+numpy
+qutip
+jupyter
