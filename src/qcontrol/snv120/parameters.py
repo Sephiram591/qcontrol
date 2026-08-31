@@ -1,189 +1,302 @@
 """
-Parameters for SnV117 center in diamond (for use with DJT Hamiltonian).
+Parameters for the SnV117 center in diamond for use with the DJT Hamiltonian.
 
-References:
-  - Ham reduction & orbital parameters (gL, p, delta_p):
-    Thiering & Gali 2018, Table IV, PhysRevX.8.021063
-  - Spin-orbit coupling (L, L_exc):
-    Thiering & Gali 2018, PhysRevX.8.021063
-  - DJT hyperfine parameters (A1, A2, A_parallel, A_perpendicular):
-    Thiering & Gali 2025, Phys. Rev. B, DOI: 10.1103/fq19-lfmv
-    "Magneto-optical properties of group-IV vacancy centers in diamond
-     upon hydrostatic pressure"
-    NOTE: These are NOT the same as the Harris et al. 2023 (PRX Quantum 4, 040301)
-    values. Harris uses Afc/Add (orbital-averaged form), while the DJT decomposition
-    separates the hyperfine into orbital-independent (A_par, A_perp) and
-    orbital-nuclear coupling (A1, A2) components. The numerical values differ
-    because they represent different decompositions of the hyperfine tensor.
+References
+----------
+- Ham reduction and orbital parameters (gL, p, delta_p):
+  Thiering & Gali 2018, Table IV, Phys. Rev. X 8, 021063.
+- Spin-orbit coupling (L, L_exc):
+  Thiering & Gali 2018, Phys. Rev. X 8, 021063.
+- DJT hyperfine parameters and effective 13C tensors:
+  Mohseni et al. 2025, Phys. Rev. B 112, 155201,
+  DOI: 10.1103/fq19-lfmv,
+  "Magneto-optical properties of group-IV-vacancy centers in diamond
+  upon hydrostatic pressure".
 
-Hyperfine parameters use the DJT form with A1, A2, A_parallel, A_perpendicular.
+Notes
+-----
+The carbon hyperfine parameters use the Appendix-D decomposition
+
+    H_HF = S^T A I + S^T Ax I sigma_z + S^T Ay I sigma_x.
+
+``HyperfineNeighbor`` indexes symmetry-distinct tensor classes rather than
+individual lattice sites. In ideal D3d symmetry:
+
+- the 6 first-neighbor carbons reduce to 3 tensor classes;
+- the 12 second-neighbor carbons reduce to 6 tensor classes;
+- every carbon tensor class has multiplicity 2 because inversion partners have
+  identical ``(A, Ax, Ay)`` tensors.
 """
+
 import math
+from enum import IntEnum
+from typing import Dict, NamedTuple, Tuple
 
 import jax.numpy as jnp
-from typing import Tuple, Dict
-from enum import IntEnum
 
-# Spin values
-S = 1/2  # Electron spin
-Sn = 1/2  # Nuclear spin (117Sn)
 
-# Electron g-factor
-gS = 2.0023
+# -----------------------------------------------------------------------------
+# Spin and orbital parameters
+# -----------------------------------------------------------------------------
 
-# Ham reduction & orbital parameters (Table IV, Thiering & Gali 2018, PhysRevX.8.021063)
-# Ground state SnV(2Eg)
-gL_gnd = 0.328       # Stevens orbital reduction factor
-p_32_gnd = 0.513     # Ham reduction factor for E_{3/2} state
-p_12_gnd = 0.429     # Ham reduction factor for E_{1/2} state
-p_gnd = 0.471        # average: (p_{3/2} + p_{1/2}) / 2
-delta_p_gnd = 0.042  # asymmetry: (p_{3/2} - p_{1/2}) / 2
-# Zeeman zz correction δf = δp * gL (paper: 0.014). Physical, keep enabled;
-# the "abnormal spectrum" it used to cause came from a sign error in Hbze_corr
-# (now fixed: the term is +2δf·μB·Bz·Sz, giving g_zz(E_3/2) = gS + 2·gL·p_{3/2}).
-delta_f_gnd = delta_p_gnd * gL_gnd  # = 0.0138
+S = 1 / 2       # Electron spin
+Sn = 1 / 2      # Nuclear spin of 117Sn
 
-# Excited state SnV(2Eu)
-# gL_exc = 0.782
-gL_exc = 0.88 # Asher revised for accuracy
+gS = 2.0023     # Electron g-factor
+
+# Ground state SnV(2Eg): Thiering & Gali 2018, Table IV.
+gL_gnd = 0.328
+p_32_gnd = 0.513
+p_12_gnd = 0.429
+p_gnd = 0.471
+
+delta_p_gnd = 0.042
+# Zeeman zz correction delta_f = delta_p * gL.
+delta_f_gnd = delta_p_gnd * gL_gnd
+
+# Excited state SnV(2Eu).
+# The value below is the revised value used by the surrounding model.
+gL_exc = 0.88
 p_32_exc = 0.429
-p_12_exc = -0.178    # negative: E_{1/2} vibronic state dominated by SOC-favored components
+p_12_exc = -0.178
 p_exc = 0.125
+
 delta_p_exc = 0.303
-delta_f_exc = delta_p_exc * gL_exc  # = 0.237 (paper: 0.238) — large, dominates ES g_zz
+delta_f_exc = delta_p_exc * gL_exc
 
-# Orbital magnetic field susceptibility: f = p * gL
-q = gL_gnd * p_gnd       # ground state
-q_exc = gL_exc * p_exc   # excited state
+# Orbital magnetic susceptibilities f = p * gL.
+f_gnd = gL_gnd * p_gnd
+f_exc = gL_exc * p_exc
 
-# Spin-orbit coupling
-L = 830.0  # [GHz] spin-orbit coupling ground state
-L_exc = 3000.0  # [GHz] spin-orbit coupling excited state
+# Backward-compatible aliases. These are orbital magnetic susceptibilities,
+# not the Appendix-D hyperfine reduction factor q_HF = (1 + p) / 2.
+q = f_gnd
+q_exc = f_exc
 
-LEVEL_OFFSET = 483796.026775 + L_exc/2
-GAMMA_FREQ = 483796.026775 + L/2
+# Spin-orbit coupling [GHz].
+L = 830.0
+L_exc = 3000.0
 
-# Hyperfine Properties
-# Ratio of electron to proton mass (mu_N/mu_B)
+LEVEL_OFFSET = 483796.026775 + L_exc / 2
+GAMMA_FREQ = 483796.026775 + L / 2
+
+
+# -----------------------------------------------------------------------------
+# Nuclear Zeeman parameters
+# -----------------------------------------------------------------------------
+
+# Ratio mu_N / mu_B.
 rmep = 5.44617021e-4
-# Nuclear/electron Zeeman ratio in code units (bz = gS*mu_B*B):
-# H_n = -g_n*mu_N*B·I with g_n(117Sn) = -2.00208 (mu = -1.00104 mu_N, I = 1/2),
-# so the coefficient is -g_n*mu_N/(gS*mu_B) = +2.00208*rmep/gS — positive, i.e.
-# the same sign as the electron term, because the 117Sn moment is negative.
+
+# Nuclear/electron Zeeman ratios in code units bz = gS * mu_B * B.
+# 117Sn: g_n = -2.00208, so the coefficient is positive.
 rg_117 = 2.00208 * rmep / gS
-rg_c13 = -2*0.702369*rmep/gS
 
-# Hyperfine parameters for 117Sn (S_n = 1/2), DJT form.
-# Values and SIGNS verbatim from Table III of Tóth, Gali & Thiering, PRB 112,
-# 155201 (2025), DOI 10.1103/fq19-lfmv (= arXiv:2408.10407v3, published version;
-# note the arXiv v1 used a different parametrization: A∥SzIz with A∥ = 976 MHz —
-# same net Hamiltonian). Used with their eq. (2) implemented verbatim in
-# hamiltonian_DJT.Hhf (note its 2A∥SzIz: A∥ is defined as ½A_zz, their eq. 4).
-# Observable check: A_PLE = A∥_exc - A∥_gnd = -473 MHz vs measured -484(8) MHz
-# (Harris et al. 2023).
+# 13C: mu = +0.702369 mu_N and I = 1/2.
+rg_c13 = -2 * 0.702369 * rmep / gS
 
-# Ground state (2Eg)
-A1_gnd = 1.1 / 1000.0        # [GHz] dynamic (orbital-off-diagonal) hyperfine A1
-A2_gnd = 1.9 / 1000.0        # [GHz] dynamic (orbital-off-diagonal) hyperfine A2
-Apar_gnd = 488.0 / 1000.0    # [GHz] parallel hyperfine coupling A∥ (= ½A_zz)
-Aperp_gnd = 1029.7 / 1000.0  # [GHz] perpendicular hyperfine coupling A⊥
 
-# Excited state (2Eu)
-A1_exc = 0.1 / 1000.0        # [GHz] dynamic hyperfine A1
-A2_exc = -0.43 / 1000.0      # [GHz] dynamic hyperfine A2
-Apar_exc = 15.0 / 1000.0     # [GHz] parallel hyperfine coupling A∥ (= ½A_zz)
-Aperp_exc = 32.3 / 1000.0    # [GHz] perpendicular hyperfine coupling A⊥
+# -----------------------------------------------------------------------------
+# Central 117Sn DJT hyperfine parameters [GHz]
+# -----------------------------------------------------------------------------
 
+# Ground state (2Eg).
+A1_gnd = 1.1 / 1000.0
+A2_gnd = 1.9 / 1000.0
+Apar_gnd = 488.0 / 1000.0
+Aperp_gnd = 1029.7 / 1000.0
+
+# Excited state (2Eu).
+A1_exc = 0.1 / 1000.0
+A2_exc = -0.43 / 1000.0
+Apar_exc = 15.0 / 1000.0
+Aperp_exc = 32.3 / 1000.0
+
+
+# -----------------------------------------------------------------------------
+# Symmetry-grouped hyperfine tensor enum
+# -----------------------------------------------------------------------------
 
 class HyperfineNeighbor(IntEnum):
-    """Nuclear species and lattice site encoded in one integer ID.
+    """Nuclear species or symmetry-distinct hyperfine tensor class.
 
-    The six first-neighbor and six second-neighbor carbon positions are stored
-    as distinct enum values, so ``SnV120Distribution`` does not need a separate
-    carbon-site field.  Sites 1/4, 2/5, and 3/6 are inversion partners.  The
-    present D3d hyperfine model therefore gives each inversion pair identical
-    tensors, while retaining distinct IDs for future symmetry-breaking models.
+    Carbon entries do not denote unique physical atoms. They denote distinct
+    ``(A, Ax, Ay)`` tensor triplets after exact inversion degeneracy has been
+    grouped:
 
-    The values 0--3 preserve the numeric meanings of the previous enum:
-    no nucleus, the Table-XII reference first-neighbor site, the Table-XII
-    reference second-neighbor site, and central 117Sn, respectively.
+    - first-neighbor shell: 6 sites -> 3 classes, multiplicity 2 each;
+    - second-neighbor shell: 12 sites -> 6 classes, multiplicity 2 each.
+
+    The second-neighbor shell contains two C3 families. ``REF`` is generated
+    from the Table-XII representative by 0 and +/-120 degree rotations.
+    ``MIRROR`` is first generated by the Figure-8 XZ mirror and is then rotated
+    by the same three C3 operations.
+
+    Integer values 0 through 7 preserve the values in the supplied
+    implementation. Values 8 through 10 append the missing mirror-family
+    second-neighbor classes.
     """
 
     NONEIGHBOR = 0
     SNV117 = 1
 
-    C13_FIRST_SITE_1_4 = 2
-    C13_FIRST_SITE_2_5 = 3
-    C13_FIRST_SITE_3_6 = 4
+    C13_FIRST_CLASS_0 = 2
+    C13_FIRST_CLASS_120 = 3
+    C13_FIRST_CLASS_N120 = 4
 
-    C13_SECOND_SITE_1_4 = 5
-    C13_SECOND_SITE_2_5 = 6
-    C13_SECOND_SITE_3_6 = 7
+    C13_SECOND_CLASS_REF_0 = 5
+    C13_SECOND_CLASS_REF_120 = 6
+    C13_SECOND_CLASS_REF_N120 = 7
+
+    C13_SECOND_CLASS_MIRROR_0 = 8
+    C13_SECOND_CLASS_MIRROR_120 = 9
+    C13_SECOND_CLASS_MIRROR_N120 = 10
 
 
-_ORDERED_HYPERFINE_NEIGHBORS = tuple(
-    sorted(HyperfineNeighbor, key=int)
-)
+_ORDERED_HYPERFINE_NEIGHBORS = tuple(sorted(HyperfineNeighbor, key=int))
 
-_expected_hyperfine_values = list(
-    range(len(_ORDERED_HYPERFINE_NEIGHBORS))
-)
+_expected_hyperfine_values = list(range(len(_ORDERED_HYPERFINE_NEIGHBORS)))
 _actual_hyperfine_values = [
     int(neighbor) for neighbor in _ORDERED_HYPERFINE_NEIGHBORS
 ]
 if _actual_hyperfine_values != _expected_hyperfine_values:
     raise ValueError(
-        "HyperfineNeighbor values must be contiguous integers starting at "
-        f"zero. Got {_actual_hyperfine_values}."
+        "HyperfineNeighbor canonical values must be contiguous integers "
+        "starting at zero. "
+        f"Got {_actual_hyperfine_values}."
     )
 
 
-# Site angles are active rotations about the local defect Z axis relative to
-# the selected Table-XII carbon site.  The paper's Appendix D gives the C3
-# transformations for the three azimuthal orientations.  Inversion partners
-# have the same tensor because electron and nuclear spins are axial vectors and
-# the hyperfine interaction is inversion even.
-_CARBON_SITE_INFO = {
-    HyperfineNeighbor.C13_FIRST_SITE_1_4: ("first", 1, 0.0),
-    HyperfineNeighbor.C13_FIRST_SITE_2_5: ("first", 2, +2.0 * math.pi / 3.0),
-    HyperfineNeighbor.C13_FIRST_SITE_3_6: ("first", 3, -2.0 * math.pi / 3.0),
-    # HyperfineNeighbor.C13_FIRST_SITE_4: ("first", 4, 0.0),
-    # HyperfineNeighbor.C13_FIRST_SITE_5: ("first", 5, +2.0 * math.pi / 3.0),
-    # HyperfineNeighbor.C13_FIRST_SITE_6: ("first", 6, -2.0 * math.pi / 3.0),
-    HyperfineNeighbor.C13_SECOND_SITE_1_4: ("second", 1, 0.0),
-    HyperfineNeighbor.C13_SECOND_SITE_2_5: ("second", 2, +2.0 * math.pi / 3.0),
-    HyperfineNeighbor.C13_SECOND_SITE_3_6: ("second", 3, -2.0 * math.pi / 3.0),
-    # HyperfineNeighbor.C13_SECOND_SITE_4: ("second", 4, 0.0),
-    # HyperfineNeighbor.C13_SECOND_SITE_5: ("second", 5, +2.0 * math.pi / 3.0),
-    # HyperfineNeighbor.C13_SECOND_SITE_6: ("second", 6, -2.0 * math.pi / 3.0),
+class _CarbonTensorClassInfo(NamedTuple):
+    """Metadata needed to generate one grouped carbon tensor class."""
+
+    shell: str
+    family: str
+    angle: float
+    multiplicity: int
+
+
+_C3_ANGLE = 2.0 * math.pi / 3.0
+
+# Angles are active rotations about the local defect Z axis relative to the
+# selected representative of each C3 family. Every class has multiplicity two
+# because its inversion partner has the same hyperfine tensor triplet.
+_CARBON_TENSOR_CLASS_INFO: Dict[
+    HyperfineNeighbor,
+    _CarbonTensorClassInfo,
+] = {
+    HyperfineNeighbor.C13_FIRST_CLASS_0: _CarbonTensorClassInfo(
+        "first", "reference", 0.0, 2
+    ),
+    HyperfineNeighbor.C13_FIRST_CLASS_120: _CarbonTensorClassInfo(
+        "first", "reference", +_C3_ANGLE, 2
+    ),
+    HyperfineNeighbor.C13_FIRST_CLASS_N120: _CarbonTensorClassInfo(
+        "first", "reference", -_C3_ANGLE, 2
+    ),
+    HyperfineNeighbor.C13_SECOND_CLASS_REF_0: _CarbonTensorClassInfo(
+        "second", "reference", 0.0, 2
+    ),
+    HyperfineNeighbor.C13_SECOND_CLASS_REF_120: _CarbonTensorClassInfo(
+        "second", "reference", +_C3_ANGLE, 2
+    ),
+    HyperfineNeighbor.C13_SECOND_CLASS_REF_N120: _CarbonTensorClassInfo(
+        "second", "reference", -_C3_ANGLE, 2
+    ),
+    HyperfineNeighbor.C13_SECOND_CLASS_MIRROR_0: _CarbonTensorClassInfo(
+        "second", "mirror", 0.0, 2
+    ),
+    HyperfineNeighbor.C13_SECOND_CLASS_MIRROR_120: _CarbonTensorClassInfo(
+        "second", "mirror", +_C3_ANGLE, 2
+    ),
+    HyperfineNeighbor.C13_SECOND_CLASS_MIRROR_N120: _CarbonTensorClassInfo(
+        "second", "mirror", -_C3_ANGLE, 2
+    ),
 }
 
+_carbon_enum_members = set(_ORDERED_HYPERFINE_NEIGHBORS) - {
+    HyperfineNeighbor.NONEIGHBOR,
+    HyperfineNeighbor.SNV117,
+}
+if set(_CARBON_TENSOR_CLASS_INFO) != _carbon_enum_members:
+    missing = sorted(
+        _carbon_enum_members - set(_CARBON_TENSOR_CLASS_INFO),
+        key=int,
+    )
+    extra = sorted(
+        set(_CARBON_TENSOR_CLASS_INFO) - _carbon_enum_members,
+        key=int,
+    )
+    raise ValueError(
+        "Carbon tensor-class metadata does not match the enum. "
+        f"Missing={missing}, extra={extra}."
+    )
+
+_first_neighbor_site_count = sum(
+    info.multiplicity
+    for info in _CARBON_TENSOR_CLASS_INFO.values()
+    if info.shell == "first"
+)
+_second_neighbor_site_count = sum(
+    info.multiplicity
+    for info in _CARBON_TENSOR_CLASS_INFO.values()
+    if info.shell == "second"
+)
+if _first_neighbor_site_count != 6:
+    raise ValueError(
+        "The grouped first-neighbor tensor classes must represent 6 physical "
+        f"sites, got {_first_neighbor_site_count}."
+    )
+if _second_neighbor_site_count != 12:
+    raise ValueError(
+        "The grouped second-neighbor tensor classes must represent 12 physical "
+        f"sites, got {_second_neighbor_site_count}."
+    )
+
+# Dense class multiplicities indexed directly by HyperfineNeighbor. NONEIGHBOR
+# is assigned multiplicity one as a single categorical outcome, not as a lattice
+# site. SNV117 is one physical nucleus. Every carbon class is an inversion pair.
+HYPERFINE_TENSOR_CLASS_MULTIPLICITY = jnp.asarray(
+    [
+        1
+        if neighbor in (
+            HyperfineNeighbor.NONEIGHBOR,
+            HyperfineNeighbor.SNV117,
+        )
+        else _CARBON_TENSOR_CLASS_INFO[neighbor].multiplicity
+        for neighbor in _ORDERED_HYPERFINE_NEIGHBORS
+    ],
+    dtype=jnp.int32,
+)
 
 # Nuclear/electron Zeeman ratio indexed directly by HyperfineNeighbor.
 rg = jnp.asarray(
     [
-        (
-            0.0
-            if neighbor == HyperfineNeighbor.NONEIGHBOR
-            else rg_117
-            if neighbor == HyperfineNeighbor.SNV117
-            else rg_c13
-        )
+        0.0
+        if neighbor == HyperfineNeighbor.NONEIGHBOR
+        else rg_117
+        if neighbor == HyperfineNeighbor.SNV117
+        else rg_c13
         for neighbor in _ORDERED_HYPERFINE_NEIGHBORS
     ]
 )
 
 
+# -----------------------------------------------------------------------------
+# Reference hyperfine tensors
+# -----------------------------------------------------------------------------
+
 # Reference Table-XII tensors use the Figure-8(e) defect frame:
 #
-#   X = [2, -1, -1] / sqrt(6)
-#   Y = [0,  1, -1] / sqrt(2)
-#   Z = [1,  1,  1] / sqrt(3)
+#   X = [ 2, -1, -1] / sqrt(6)
+#   Y = [ 0,  1, -1] / sqrt(2)
+#   Z = [ 1,  1,  1] / sqrt(3)
 #
-# Component order is Axx, Ayy, Azz, Axy, Axz, Ayz.  Carbon values are reported
-# in MHz and converted here to GHz.  The excited-state second-neighbor coupling
-# is approximated as zero because the paper reports it as almost negligible and
-# does not tabulate a separate tensor triplet.
+# Component order is [Axx, Ayy, Azz, Axy, Axz, Ayz]. Carbon values are
+# reported in MHz and converted here to GHz. The excited-state second-neighbor
+# coupling is approximated as zero because the paper reports it as almost
+# negligible and does not tabulate a separate excited-state second-neighbor
+# triplet.
 _ZERO6 = jnp.zeros((6,))
 
 _C13_FIRST_GND_REFERENCE = (
@@ -191,36 +304,59 @@ _C13_FIRST_GND_REFERENCE = (
     jnp.asarray([-21.4, -9.3, -10.8, 1.3, -4.3, 0.4]) * 1e-3,
     jnp.asarray([-49.3, -21.3, -24.9, -1.0, -9.8, -0.3]) * 1e-3,
 )
+
 _C13_SECOND_GND_REFERENCE = (
     jnp.asarray([-4.1, -5.3, -4.9, -0.8, -0.2, 0.5]) * 1e-3,
     jnp.asarray([1.9, 2.1, 2.1, 0.3, 0.4, -0.3]) * 1e-3,
     jnp.asarray([2.1, 2.4, 3.2, 0.2, -0.1, 0.2]) * 1e-3,
 )
+
 _C13_FIRST_EXC_REFERENCE = (
     jnp.asarray([54.96, 33.86, 28.43, 0.03, 8.83, -0.02]) * 1e-3,
     jnp.asarray([-18.26, -3.71, -7.19, -2.77, -4.75, 2.38]) * 1e-3,
     jnp.asarray([-42.01, -8.31, -16.44, 2.15, -10.99, -1.85]) * 1e-3,
 )
+
 _C13_SECOND_EXC_REFERENCE = (
     _ZERO6,
     _ZERO6,
     _ZERO6,
 )
 
+# Central 117Sn tensors in the same six-component storage convention.
 _SN117_GND = (
-    jnp.asarray([Aperp_gnd, Aperp_gnd, 2.0 * Apar_gnd, 0.0, 0.0, 0.0]),
-    jnp.asarray([-A2_gnd / 2.0, A2_gnd / 2.0, 0.0, 0.0, A1_gnd, 0.0]),
-    jnp.asarray([0.0, 0.0, 0.0, -A2_gnd / 2.0, 0.0, -A1_gnd]),
-)
-_SN117_EXC = (
-    jnp.asarray([Aperp_exc, Aperp_exc, 2.0 * Apar_exc, 0.0, 0.0, 0.0]),
-    jnp.asarray([-A2_exc / 2.0, A2_exc / 2.0, 0.0, 0.0, A1_exc, 0.0]),
-    jnp.asarray([0.0, 0.0, 0.0, -A2_exc / 2.0, 0.0, -A1_exc]),
+    jnp.asarray(
+        [Aperp_gnd, Aperp_gnd, 2.0 * Apar_gnd, 0.0, 0.0, 0.0]
+    ),
+    jnp.asarray(
+        [-A2_gnd / 2.0, A2_gnd / 2.0, 0.0, 0.0, A1_gnd, 0.0]
+    ),
+    jnp.asarray(
+        [0.0, 0.0, 0.0, -A2_gnd / 2.0, 0.0, -A1_gnd]
+    ),
 )
 
+_SN117_EXC = (
+    jnp.asarray(
+        [Aperp_exc, Aperp_exc, 2.0 * Apar_exc, 0.0, 0.0, 0.0]
+    ),
+    jnp.asarray(
+        [-A2_exc / 2.0, A2_exc / 2.0, 0.0, 0.0, A1_exc, 0.0]
+    ),
+    jnp.asarray(
+        [0.0, 0.0, 0.0, -A2_exc / 2.0, 0.0, -A1_exc]
+    ),
+)
+
+HyperfineTriplet = Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+
+
+# -----------------------------------------------------------------------------
+# Tensor conversion and symmetry transforms
+# -----------------------------------------------------------------------------
 
 def _tensor6_to_symmetric_matrix(values: jnp.ndarray) -> jnp.ndarray:
-    """Expand ``[xx, yy, zz, xy, xz, yz]`` to a symmetric matrix."""
+    """Expand ``[xx, yy, zz, xy, xz, yz]`` into a symmetric 3x3 matrix."""
     values = jnp.asarray(values)
     if values.shape != (6,):
         raise ValueError(
@@ -247,8 +383,8 @@ def _symmetric_matrix_to_tensor6(tensor: jnp.ndarray) -> jnp.ndarray:
             f"got {tensor.shape}."
         )
 
-    # Remove only roundoff-level antisymmetric components introduced by the
-    # matrix products below.
+    # Remove only roundoff-level antisymmetric components introduced by matrix
+    # multiplication.
     tensor = 0.5 * (tensor + tensor.T)
     return jnp.asarray(
         [
@@ -262,31 +398,85 @@ def _symmetric_matrix_to_tensor6(tensor: jnp.ndarray) -> jnp.ndarray:
     )
 
 
+def _transform_carbon_hyperfine_triplet(
+    triplet: HyperfineTriplet,
+    cartesian_transform: jnp.ndarray,
+    orbital_transform: jnp.ndarray,
+) -> HyperfineTriplet:
+    """Apply linked Cartesian and orbital transformations to ``(A, Ax, Ay)``.
+
+    ``cartesian_transform`` acts on the spatial tensor indices. Although spin
+    and nuclear spin are axial vectors, the determinant signs from an improper
+    operation occur twice and cancel, so every hyperfine tensor transforms as
+
+        T' = Q T Q^T.
+
+    ``orbital_transform`` acts on the coefficient pair ``(Ax, Ay)`` that
+    multiplies ``(sigma_z, sigma_x)``.
+    """
+    cartesian_transform = jnp.asarray(cartesian_transform)
+    orbital_transform = jnp.asarray(orbital_transform)
+
+    if cartesian_transform.shape != (3, 3):
+        raise ValueError(
+            "cartesian_transform must have shape (3, 3), "
+            f"got {cartesian_transform.shape}."
+        )
+    if orbital_transform.shape != (2, 2):
+        raise ValueError(
+            "orbital_transform must have shape (2, 2), "
+            f"got {orbital_transform.shape}."
+        )
+
+    A, Ax, Ay = (
+        _tensor6_to_symmetric_matrix(values) for values in triplet
+    )
+
+    Ax_orbital_transformed = (
+        orbital_transform[0, 0] * Ax
+        + orbital_transform[0, 1] * Ay
+    )
+    Ay_orbital_transformed = (
+        orbital_transform[1, 0] * Ax
+        + orbital_transform[1, 1] * Ay
+    )
+
+    def transform_cartesian(tensor: jnp.ndarray) -> jnp.ndarray:
+        return (
+            cartesian_transform
+            @ tensor
+            @ cartesian_transform.T
+        )
+
+    return (
+        _symmetric_matrix_to_tensor6(transform_cartesian(A)),
+        _symmetric_matrix_to_tensor6(
+            transform_cartesian(Ax_orbital_transformed)
+        ),
+        _symmetric_matrix_to_tensor6(
+            transform_cartesian(Ay_orbital_transformed)
+        ),
+    )
+
+
 def _rotate_carbon_hyperfine_triplet(
-    triplet: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    triplet: HyperfineTriplet,
     angle: float,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Rotate a selected-site ``(A, Ax, Ay)`` triplet to another C3 site.
+) -> HyperfineTriplet:
+    """Rotate a representative ``(A, Ax, Ay)`` triplet to a C3-related class.
 
     ``angle`` is an active rotation of the physical carbon site about the local
-    defect Z axis.  The Cartesian tensor indices rotate by ``angle``.  The
-    orbital pair multiplying ``(sigma_z, sigma_x)`` rotates by ``2 * angle``:
+    defect Z axis. The Cartesian indices rotate by ``angle``. The coefficient
+    pair multiplying ``(sigma_z, sigma_x)`` rotates by ``2 * angle``:
 
         Ax(phi) = R(phi) [cos(2phi) Ax - sin(2phi) Ay] R(phi)^T
         Ay(phi) = R(phi) [sin(2phi) Ax + cos(2phi) Ay] R(phi)^T
 
-    The double angle is required because ``sigma_z`` and ``sigma_x`` are
-    quadratic bilinears of the real ``(e_x, e_y)`` orbital amplitudes.  This is
-    the site transformation underlying Appendix-D Eqs. (D5a)--(D5b).
+    This is the transformation underlying Appendix-D Eqs. (D5a)-(D5b).
     """
-    A, Ax, Ay = (
-        _tensor6_to_symmetric_matrix(values)
-        for values in triplet
-    )
-
     cos_phi = math.cos(angle)
     sin_phi = math.sin(angle)
-    rotation = jnp.asarray(
+    cartesian_rotation = jnp.asarray(
         [
             [cos_phi, -sin_phi, 0.0],
             [sin_phi, cos_phi, 0.0],
@@ -296,21 +486,103 @@ def _rotate_carbon_hyperfine_triplet(
 
     cos_2phi = math.cos(2.0 * angle)
     sin_2phi = math.sin(2.0 * angle)
-    Ax_orbital_rotated = cos_2phi * Ax - sin_2phi * Ay
-    Ay_orbital_rotated = sin_2phi * Ax + cos_2phi * Ay
-
-    def rotate_cartesian(tensor: jnp.ndarray) -> jnp.ndarray:
-        return rotation @ tensor @ rotation.T
-
-    return (
-        _symmetric_matrix_to_tensor6(rotate_cartesian(A)),
-        _symmetric_matrix_to_tensor6(
-            rotate_cartesian(Ax_orbital_rotated)
-        ),
-        _symmetric_matrix_to_tensor6(
-            rotate_cartesian(Ay_orbital_rotated)
-        ),
+    orbital_rotation = jnp.asarray(
+        [
+            [cos_2phi, -sin_2phi],
+            [sin_2phi, cos_2phi],
+        ]
     )
+
+    return _transform_carbon_hyperfine_triplet(
+        triplet,
+        cartesian_rotation,
+        orbital_rotation,
+    )
+
+
+def _mirror_carbon_hyperfine_triplet(
+    triplet: HyperfineTriplet,
+) -> HyperfineTriplet:
+    """Generate the other second-neighbor C3 family using the XZ mirror.
+
+    In the Figure-8 local frame, reflection in the XZ plane is
+
+        M = diag(1, -1, 1).
+
+    Appendix D chooses the real orbital basis so that ``e_x`` is mirror-even
+    and ``e_y`` is mirror-odd. Therefore
+
+        sigma_z -> +sigma_z,
+        sigma_x -> -sigma_x,
+
+    and the linked transformations are
+
+        A  ->  M A  M^T,
+        Ax ->  M Ax M^T,
+        Ay -> -M Ay M^T.
+
+    For the first-neighbor shell this mirror does not add a new grouped tensor
+    family: it maps the reference C3 family onto itself or its inversion
+    partners. For the generic second-neighbor shell it produces the missing
+    second C3 family.
+    """
+    cartesian_mirror = jnp.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    orbital_mirror = jnp.asarray(
+        [
+            [1.0, 0.0],
+            [0.0, -1.0],
+        ]
+    )
+
+    return _transform_carbon_hyperfine_triplet(
+        triplet,
+        cartesian_mirror,
+        orbital_mirror,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Build grouped tensor dictionaries and dense arrays
+# -----------------------------------------------------------------------------
+
+def _get_reference_triplet(
+    shell: str,
+    state: str,
+) -> HyperfineTriplet:
+    """Return the Table-XII representative triplet for a shell and state."""
+    if shell == "first" and state == "ground":
+        return _C13_FIRST_GND_REFERENCE
+    if shell == "first" and state == "excited":
+        return _C13_FIRST_EXC_REFERENCE
+    if shell == "second" and state == "ground":
+        return _C13_SECOND_GND_REFERENCE
+    if shell == "second" and state == "excited":
+        return _C13_SECOND_EXC_REFERENCE
+
+    raise ValueError(
+        f"Unsupported carbon shell/state combination: {shell!r}, {state!r}."
+    )
+
+
+def _build_carbon_class_triplet(
+    info: _CarbonTensorClassInfo,
+    state: str,
+) -> HyperfineTriplet:
+    """Construct one symmetry-grouped carbon hyperfine tensor triplet."""
+    reference = _get_reference_triplet(info.shell, state)
+
+    if info.family == "mirror":
+        reference = _mirror_carbon_hyperfine_triplet(reference)
+    elif info.family != "reference":
+        raise ValueError(f"Unknown carbon C3 family {info.family!r}.")
+
+    return _rotate_carbon_hyperfine_triplet(reference, info.angle)
 
 
 def _build_hyperfine_vector_dictionaries() -> Tuple[
@@ -321,7 +593,7 @@ def _build_hyperfine_vector_dictionaries() -> Tuple[
     Dict[HyperfineNeighbor, jnp.ndarray],
     Dict[HyperfineNeighbor, jnp.ndarray],
 ]:
-    """Build six-component tensor dictionaries for every enum member."""
+    """Build six-component tensor dictionaries for every canonical enum class."""
     A_gnd: Dict[HyperfineNeighbor, jnp.ndarray] = {}
     Ax_gnd: Dict[HyperfineNeighbor, jnp.ndarray] = {}
     Ay_gnd: Dict[HyperfineNeighbor, jnp.ndarray] = {}
@@ -337,22 +609,9 @@ def _build_hyperfine_vector_dictionaries() -> Tuple[
             ground_triplet = _SN117_GND
             excited_triplet = _SN117_EXC
         else:
-            shell, _, angle = _CARBON_SITE_INFO[neighbor]
-            if shell == "first":
-                ground_reference = _C13_FIRST_GND_REFERENCE
-                excited_reference = _C13_FIRST_EXC_REFERENCE
-            else:
-                ground_reference = _C13_SECOND_GND_REFERENCE
-                excited_reference = _C13_SECOND_EXC_REFERENCE
-
-            ground_triplet = _rotate_carbon_hyperfine_triplet(
-                ground_reference,
-                angle,
-            )
-            excited_triplet = _rotate_carbon_hyperfine_triplet(
-                excited_reference,
-                angle,
-            )
+            info = _CARBON_TENSOR_CLASS_INFO[neighbor]
+            ground_triplet = _build_carbon_class_triplet(info, "ground")
+            excited_triplet = _build_carbon_class_triplet(info, "excited")
 
         A_gnd[neighbor], Ax_gnd[neighbor], Ay_gnd[neighbor] = ground_triplet
         A_exc[neighbor], Ax_exc[neighbor], Ay_exc[neighbor] = excited_triplet
@@ -385,16 +644,15 @@ def build_hyperfine_tensors(
     jnp.ndarray,
     jnp.ndarray,
 ]:
-    """Convert six hyperfine dictionaries into dense symmetric tensors.
+    """Convert six tensor dictionaries into dense symmetric tensor arrays.
 
-    Each dictionary maps every unique ``HyperfineNeighbor`` ID to a vector
-    ordered as ``[Axx, Ayy, Azz, Axy, Axz, Ayz]``.
+    Each dictionary maps every canonical ``HyperfineNeighbor`` class to a
+    six-component vector ordered as ``[Axx, Ayy, Azz, Axy, Axz, Ayz]``.
 
     Returns
     -------
     A_gnd, Ax_gnd, Ay_gnd, A_exc, Ax_exc, Ay_exc
-        Arrays of shape ``(n_neighbors, 3, 3)`` indexed directly by the enum's
-        integer value.
+        Arrays of shape ``(11, 3, 3)`` indexed directly by the enum integer.
     """
 
     def build_one(
@@ -409,9 +667,7 @@ def build_hyperfine_tensors(
                     f"HyperfineNeighbor.{neighbor.name}."
                 )
 
-            tensors.append(
-                _tensor6_to_symmetric_matrix(source[neighbor])
-            )
+            tensors.append(_tensor6_to_symmetric_matrix(source[neighbor]))
 
         return jnp.stack(tensors, axis=0)
 
@@ -440,3 +696,89 @@ def build_hyperfine_tensors(
     Ax_exc,
     Ay_exc,
 )
+
+
+def validate_hyperfine_tensor_classes(
+    atol: float = 1e-7,
+) -> None:
+    """Validate array shapes, symmetry, multiplicities, and group relations."""
+    expected_shape = (len(_ORDERED_HYPERFINE_NEIGHBORS), 3, 3)
+    dense_arrays = (
+        A_GND_TENSORS,
+        AX_GND_TENSORS,
+        AY_GND_TENSORS,
+        A_EXC_TENSORS,
+        AX_EXC_TENSORS,
+        AY_EXC_TENSORS,
+    )
+
+    for tensor_array in dense_arrays:
+        if tensor_array.shape != expected_shape:
+            raise ValueError(
+                f"Expected dense tensor shape {expected_shape}, "
+                f"got {tensor_array.shape}."
+            )
+        if not bool(
+            jnp.allclose(
+                tensor_array,
+                jnp.swapaxes(tensor_array, -1, -2),
+                atol=atol,
+                rtol=0.0,
+            )
+        ):
+            raise ValueError("A generated hyperfine tensor is not symmetric.")
+
+    # The zero-angle reference classes must reproduce the input representatives.
+    reference_checks = (
+        (
+            HyperfineNeighbor.C13_FIRST_CLASS_0,
+            _C13_FIRST_GND_REFERENCE,
+            (A_gnd, Ax_gnd, Ay_gnd),
+        ),
+        (
+            HyperfineNeighbor.C13_SECOND_CLASS_REF_0,
+            _C13_SECOND_GND_REFERENCE,
+            (A_gnd, Ax_gnd, Ay_gnd),
+        ),
+        (
+            HyperfineNeighbor.C13_FIRST_CLASS_0,
+            _C13_FIRST_EXC_REFERENCE,
+            (A_exc, Ax_exc, Ay_exc),
+        ),
+        (
+            HyperfineNeighbor.C13_SECOND_CLASS_REF_0,
+            _C13_SECOND_EXC_REFERENCE,
+            (A_exc, Ax_exc, Ay_exc),
+        ),
+    )
+    for neighbor, expected_triplet, dictionaries in reference_checks:
+        actual_triplet = tuple(source[neighbor] for source in dictionaries)
+        for actual, expected in zip(actual_triplet, expected_triplet):
+            if not bool(jnp.allclose(actual, expected, atol=atol, rtol=0.0)):
+                raise ValueError(
+                    f"Reference tensor mismatch for {neighbor.name}."
+                )
+
+    # Applying the mirror twice must return the original representative.
+    mirrored_twice = _mirror_carbon_hyperfine_triplet(
+        _mirror_carbon_hyperfine_triplet(_C13_SECOND_GND_REFERENCE)
+    )
+    for actual, expected in zip(
+        mirrored_twice,
+        _C13_SECOND_GND_REFERENCE,
+    ):
+        if not bool(jnp.allclose(actual, expected, atol=atol, rtol=0.0)):
+            raise ValueError("The carbon mirror transform is not involutory.")
+
+    # Three successive +120 degree rotations must return the original triplet.
+    rotated = _C13_SECOND_GND_REFERENCE
+    for _ in range(3):
+        rotated = _rotate_carbon_hyperfine_triplet(rotated, +_C3_ANGLE)
+    for actual, expected in zip(rotated, _C13_SECOND_GND_REFERENCE):
+        if not bool(jnp.allclose(actual, expected, atol=atol, rtol=0.0)):
+            raise ValueError(
+                "The carbon C3 transform does not close after 3 steps."
+            )
+
+
+validate_hyperfine_tensor_classes()

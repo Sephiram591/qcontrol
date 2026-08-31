@@ -6,6 +6,7 @@ import numpy as np
 import jax.scipy.special as jsp_special
 import qcontrol.snv120.parameters as params
 import qcontrol.snv120.hamiltonian_jqt as qh_jqt
+from qcontrol.snv120.jqt_ext import sesolve_components, mesolve_components
 import jaxquantum as jqt
 from pulseseq.sequencing.waveform import AnalogPulse, Apodization, Shape, DigitalPulse, DigitalType
 import qcontrol.snv120.pulseseq_interconnect
@@ -13,8 +14,8 @@ from qcontrol.snv120.pulseseq_interconnect import stack_waveforms, make_analog_p
 
 from pulseseq.sequencing.waveform import AnalogPulse, Apodization, Shape, DigitalPulse, DigitalType
 
-def lowpass_filter(omega_c):
-    """Return a first-order low-pass filter.
+def lowpass_filter(omega_c, omega_r=0.0):
+    """Return a first-order low-pass filter, where the DC frequency lies at -omega_r.
 
     The transfer function is
 
@@ -22,7 +23,7 @@ def lowpass_filter(omega_c):
 
     Args:
         omega_c: Angular cutoff frequency in radians per second.
-
+        omega_r: Rotating frame frequency in radians per second.
     Returns:
         A filter function compatible with ``sesolve_components``.
     """
@@ -30,7 +31,40 @@ def lowpass_filter(omega_c):
 
     def filter_fn(t, z, u):
         del t
-        dz_dt = omega_c * (u - z)
+        dz_dt = omega_c * (u - z) - 1j * omega_r * z
+        return dz_dt, z
+
+    return filter_fn
+
+def lorentzian_filter(omega_0, gamma):
+    """Return a Lorentzian bandpass filter.
+
+    The transfer function is
+
+        H(s) = gamma / (s + gamma - 1j * omega_0).
+
+    The corresponding power response is
+
+        |H(i*omega)|^2
+            = gamma^2 / (gamma^2 + (omega - omega_0)^2),
+
+    which is a Lorentzian centered at omega_0 with angular-frequency
+    HWHM gamma and FWHM 2*gamma.
+
+    Args:
+        omega_0: Center angular frequency in radians per second.
+        gamma: Angular-frequency half-width at half-maximum (HWHM)
+            in radians per second.
+
+    Returns:
+        A filter function compatible with ``sesolve_components``.
+    """
+    omega_0 = jnp.asarray(omega_0)
+    gamma = jnp.asarray(gamma)
+
+    def filter_fn(t, z, u):
+        del t
+        dz_dt = gamma * u + (-gamma + 1j * omega_0) * z
         return dz_dt, z
 
     return filter_fn
@@ -61,6 +95,65 @@ def normalize_vectors(vector):
     """Normalize vectors along their final Cartesian-component axis."""
     vector = jnp.asarray(vector)
     return vector / jnp.linalg.norm(vector, axis=-1, keepdims=True)
+
+
+def _dipole_basis_crystal_from_axis(dipole_z_crystal):
+    """Construct the paper-compatible local SnV frame in crystal coordinates.
+
+    The hyperfine tensors in Table XII of Mohseni *et al.* use the frame shown
+    in their Fig. 8(e).  For a [111] defect this is
+
+        X = [2, -1, -1] / sqrt(6),
+        Y = [0,  1, -1] / sqrt(2),
+        Z = [1,  1,  1] / sqrt(3).
+
+    Equivalently, X is the normalized projection of crystal [100] onto the
+    plane perpendicular to the selected defect axis, and Y = Z x X.  This
+    definition generalizes consistently to every selected <111> orientation.
+
+    Parameters
+    ----------
+    dipole_z_crystal : array_like, shape (..., 3)
+        Selected defect-axis directions in crystal coordinates.
+
+    Returns
+    -------
+    jax.Array, shape (..., 3, 3)
+        Matrix whose columns are the local X, Y, and Z basis vectors expressed
+        in crystal coordinates.
+    """
+    dipole_z_crystal = normalize_vectors(dipole_z_crystal)
+
+    crystal_x = jnp.asarray(
+        [1.0, 0.0, 0.0],
+        dtype=dipole_z_crystal.dtype,
+    )
+
+    dipole_x_crystal = normalize_vectors(
+        crystal_x
+        - jnp.sum(
+            crystal_x * dipole_z_crystal,
+            axis=-1,
+            keepdims=True,
+        )
+        * dipole_z_crystal
+    )
+
+    dipole_y_crystal = normalize_vectors(
+        jnp.cross(
+            dipole_z_crystal,
+            dipole_x_crystal,
+        )
+    )
+
+    return jnp.stack(
+        [
+            dipole_x_crystal,
+            dipole_y_crystal,
+            dipole_z_crystal,
+        ],
+        axis=-1,
+    )
 
 @jax.jit(static_argnums=(1, 2))
 def _bessel_j_nonnegative_orders_integer_series(
@@ -104,14 +197,14 @@ def _bessel_j_nonnegative_orders_integer_series(
 
 class SnVConstants(NamedTuple):
     B_target: jnp.ndarray                   # (3,) target electron-Zeeman vector in the dipole frame, units of GHz
-    resonant_pump_polarization_target: jnp.ndarray # (TE, TM) fraction of resonant pump coupling to the TE and TM modes
+    target_dipole_operator: jnp.ndarray # (x,y,z) vector in the local dipole frame. May be impossible to reach given only 2 modes, but the closest orthogonal projection will be solved for
     mw_amps: float                    # microwave amp setting for RFSoC
     optical_amps: float               # optical amp setting for RFSoC
     laser_frequency: float            # laser frequency, units of GHz
     diamond_lattice_100_orientation: jnp.ndarray # Best estimate of (theta, phi) for the diamond lattice [100] axis in the lab frame
     diamond_lattice_011_orientation: jnp.ndarray # Best estimate of (theta, phi) for the diamond lattice [011] axis in the lab frame
     nominal_magnet_axes: jnp.ndarray        # (3, 3) nominal magnet-axis unit vectors in the lab frame
-    sampling_rate: float                    # awg sampling rate, units of Hz
+    sampling_rate: float                    # awg sampling rate, units of GHz
     # Physical constants
     mu_B_GHz_per_T = 13.996 # [GHz/T]
     g_e = 2.0
@@ -121,6 +214,12 @@ class SnVConstants(NamedTuple):
         [-1,1,1],
         [-1,-1,1]
     ])
+    # tperp: float # Perpendicular strain susceptibility, units of GHz/strain
+    # tpar: float # Parallel strain susceptibility, units of GHz/strain
+    # f_gnd: float # Transverse orbital mixing strain susceptibility, units of GHz/strain
+    # d_gnd: float # Shear orbital splitting strain susceptibility, units of GHz/strain
+    # f_exc: float # Transverse orbital mixing strain susceptibility, units of GHz/strain
+    # d_exc: float # Shear orbital splitting strain susceptibility, units of GHz/strain
 
 
 class SnV120Distribution(NamedTuple):
@@ -139,11 +238,8 @@ class SnV120Distribution(NamedTuple):
     # resonant_pump_E_angles: jnp.ndarray # (N, 2, 2), (theta, phi) of the electric field of the resonant pump for TE and TM modes in the crystal frame
 
     # Hamiltonian parameters
-    alpha: jnp.ndarray     # N
-    beta: jnp.ndarray      # N
-    alpha_exc: jnp.ndarray # N
-    beta_exc: jnp.ndarray  # N
-    hyperfine_neighbor_idx: jnp.ndarray # N, HyperfineNeighbor enum values
+    strain_params: jnp.ndarray # (N, 5) zpl_shift, alpha, beta, alpha_exc, beta_exc. Old def: epsilon strain tensor in the dipole frame. Order is (xx, yy, zz, xy, xz, yz)
+    hyperfine_neighbor_idx: jnp.ndarray # N, HyperfineNeighbor IDs
     
     excited_state_lifetime: jnp.ndarray # N, in units of nanoseconds
     # Collection efficiency parameters
@@ -153,8 +249,16 @@ class SnV120Distribution(NamedTuple):
     dark_count_rate: jnp.ndarray      # N
 
     # Resonant pump coupling
-    resonant_pump_coupling_rate: jnp.ndarray # (N, 2), in units of coupling rate, or GHz for TE and TM modes
-    resonant_pump_polarization: jnp.ndarray  # (N, 1), Angle of the resonant pump polarization with respect to the TE mode without factoring in the waveplates
+    resonant_pump_coupling_rate: jnp.ndarray # (N), in units of GHz for the TE mode.
+    resonant_pump_pdl_ratio : jnp.ndarray # (N), the TE/TM transmission ratio
+    resonant_pump_polarization: jnp.ndarray  # N, Angle of the resonant pump polarization with respect to the TE mode without factoring in the waveplates
+    resonant_pump_phase: jnp.ndarray  # N, Phase difference between the TE and TM modes without factoring in the waveplates
+    # transmission_to_diamond: jnp.ndarray # (N, 2), Transmission from the edge coupler to the diamond for the TE and TM modes
+    mode_field_orientation: jnp.ndarray # (N, 2, 2), Electric field orientation for the TE and TM modes in the crystal frame
+    transmission_out_diamond: jnp.ndarray # (N, 2), Transmission from the diamond to the edge coupler for the TE and TM modes
+    reflection_from_pic: jnp.ndarray # (N, 2), Reflection of the resonant pump from the PIC to the APD for the TE and TM modes
+
+    # EOM drive settings
     eom_vpi_ratio: jnp.ndarray               # N, in units of Vmax/Vpi
     eom_vpi_bandwidth: jnp.ndarray           # N, in units of GHz
 
@@ -167,6 +271,26 @@ class SnV120Distribution(NamedTuple):
     spectral_diffusion_rate: jnp.ndarray  # N, in units of Hz/sqrt(s)
     polarization_drift_rate: jnp.ndarray  # N, in units of rads/sqrt(s)
     resonant_pump_coupling_drift_rate: jnp.ndarray # N, in units of rads/sqrt(s)
+
+    # @jax.jit
+    # def get_zpl_shift(self, idx):
+        # eps_xx = self.strain_tensor[idx, 0]
+        # eps_yy = self.strain_tensor[idx, 1]
+        # eps_zz = self.strain_tensor[idx, 2]
+        # return self.constants.tperp * (eps_xx + eps_yy) + self.constants.tpar * eps_zz
+
+    # @jax.jit
+    # def get_alpha_beta(self, idx):
+        # eps_xx = self.strain_tensor[idx, 0]
+        # eps_yy = self.strain_tensor[idx, 1]
+        # eps_xy = self.strain_tensor[idx, 3]
+        # eps_xz = self.strain_tensor[idx, 4]
+        # eps_yz = self.strain_tensor[idx, 5]
+        # alpha_gnd = -self.constants.d_gnd * (eps_xx - eps_yy) - self.constants.f_gnd * eps_xz
+        # alpha_exc = -self.constants.d_exc * (eps_xx - eps_yy) - self.constants.f_exc * eps_xz
+        # beta_gnd = 2*self.constants.d_gnd * eps_xy - self.constants.f_gnd * eps_yz
+        # beta_exc = 2*self.constants.d_exc * eps_xy - self.constants.f_exc * eps_yz
+        # return alpha_gnd, beta_gnd, alpha_exc, beta_exc
 
     def _prepare_indices(self, idx):
         """Normalize public scalar/array/None indices for the jitted batch cores."""
@@ -183,6 +307,31 @@ class SnV120Distribution(NamedTuple):
             )
 
         return idx_array, scalar_idx
+
+    def _prepare_experiment_index(self, experiment_idx):
+        """Normalize the distribution member used to choose control settings.
+
+        ``experiment_idx`` identifies one distribution member whose optimal
+        vector-magnet and waveplate settings are applied while evaluating every
+        member selected by ``idx``.  It is intentionally restricted to one
+        scalar index: an array of experiment indices would require an additional
+        experiment batch axis rather than the shared-settings behavior used by
+        the Hamiltonian methods.
+        """
+        if experiment_idx is None:
+            return None
+
+        experiment_idx = jnp.atleast_1d(
+            jnp.asarray(experiment_idx, dtype=jnp.int32)
+        )
+
+        if experiment_idx.ndim != 1 or experiment_idx.shape[0] != 1:
+            raise ValueError(
+                "`experiment_idx` must be a scalar integer or a length-one "
+                "integer array."
+            )
+
+        return experiment_idx
 
     def _select_scalar_parameter_batch(self, value, idx):
         """Select a shared scalar or particle-resolved scalar parameter.
@@ -553,57 +702,26 @@ class SnV120Distribution(NamedTuple):
         # Construct the dipole basis in crystal coordinates
         # -------------------------------------------------------------------------
 
-        # The selected <111> crystal direction defines the dipole-frame z axis.
+        # The selected <111> crystal direction defines the dipole-frame Z axis.
+        # X and Y follow the Fig. 8(e) convention used by the carbon hyperfine
+        # tensors in Table XII.  For the canonical [111] orientation this gives
+        # X=[2,-1,-1]/sqrt(6) and Y=[0,1,-1]/sqrt(2).
         #
         # Shape:
         #     (K, 3)
-        dipole_z_crystal = normalize_vectors(
-            jnp.asarray(
-                self.constants.dipole_crystal_axes,
-                dtype=magnet_axes_crystal.dtype,
-            )[
-                self.dipole_crystal_axis_idx[idx]
-            ]
-        )
-
-        # Crystal [001].
-        crystal_z = jnp.asarray(
-            [0.0, 0.0, 1.0],
+        dipole_z_crystal = jnp.asarray(
+            self.constants.dipole_crystal_axes,
             dtype=magnet_axes_crystal.dtype,
-        )
-
-        # Use crystal [001] to fix the otherwise arbitrary rotation about the
-        # selected <111> dipole axis.
-        #
-        # y_dipole = z_crystal x z_dipole
-        dipole_y_crystal = normalize_vectors(
-            jnp.cross(
-                crystal_z,
-                dipole_z_crystal,
-            )
-        )
-
-        # Complete the right-handed basis.
-        #
-        # x_dipole = y_dipole x z_dipole
-        dipole_x_crystal = normalize_vectors(
-            jnp.cross(
-                dipole_y_crystal,
-                dipole_z_crystal,
-            )
-        )
+        )[
+            self.dipole_crystal_axis_idx[idx]
+        ]
 
         # Columns are dipole basis vectors expressed in crystal coordinates.
         #
         # Shape:
         #     (K, 3, 3)
-        dipole_to_crystal = jnp.stack(
-            [
-                dipole_x_crystal,
-                dipole_y_crystal,
-                dipole_z_crystal,
-            ],
-            axis=-1,
+        dipole_to_crystal = _dipole_basis_crystal_from_axis(
+            dipole_z_crystal
         )
 
         # -------------------------------------------------------------------------
@@ -694,8 +812,13 @@ class SnV120Distribution(NamedTuple):
         return result[0] if scalar_idx else result
 
     @jax.jit(static_argnames=("frame",))
-    def get_B_cartesian_batch(self, idx, frame="lab"):
-        """Return the realized magnetic-field vectors in tesla.
+    def get_B_cartesian_batch(
+        self,
+        idx,
+        frame="lab",
+        experiment_idx=None,
+    ):
+        """Return realized magnetic-field vectors in tesla.
 
         Parameters
         ----------
@@ -703,6 +826,10 @@ class SnV120Distribution(NamedTuple):
             Distribution indices.
         frame : {"lab", "crystal", "dipole"}, optional
             Output coordinate frame; static under JIT.
+        experiment_idx : int or length-one jax.Array or None, optional
+            Distribution member used to calculate the shared vector-magnet
+            settings. If ``None``, each member in ``idx`` uses its own optimal
+            settings, preserving the original behavior.
 
         Returns
         -------
@@ -713,7 +840,22 @@ class SnV120Distribution(NamedTuple):
         if idx.ndim != 1:
             raise ValueError("`idx` must be a one-dimensional integer array.")
 
-        B_settings = self.get_B_settings_batch(idx)
+        experiment_idx = self._prepare_experiment_index(experiment_idx)
+
+        if experiment_idx is None:
+            B_settings = self.get_B_settings_batch(idx)
+        else:
+            # Calculate the physical vector-magnet controls once for the
+            # experiment member, then apply those same controls to every model
+            # member selected by idx.
+            shared_B_settings = self.get_B_settings_batch(
+                experiment_idx
+            )[0]
+            B_settings = jnp.broadcast_to(
+                shared_B_settings,
+                (idx.shape[0], shared_B_settings.shape[0]),
+            )
+
         B_axes = self.get_magnet_axes_batch(idx, frame=frame)
 
         return jnp.sum(
@@ -734,9 +876,18 @@ class SnV120Distribution(NamedTuple):
         return result[0] if scalar_idx else result
 
     @jax.jit(static_argnames=("frame",))
-    def get_B_spherical_batch(self, idx, frame="dipole"):
+    def get_B_spherical_batch(
+        self,
+        idx,
+        frame="dipole",
+        experiment_idx=None,
+    ):
         """Return field magnitude in GHz and direction angles for an index batch."""
-        B_T = self.get_B_cartesian_batch(idx, frame=frame)
+        B_T = self.get_B_cartesian_batch(
+            idx,
+            frame=frame,
+            experiment_idx=experiment_idx,
+        )
         theta, phi = cartesian_to_angles(B_T)
         magnitude_GHz = jnp.linalg.norm(B_T, axis=-1) * (
             self.constants.mu_B_GHz_per_T * self.constants.g_e
@@ -784,6 +935,204 @@ class SnV120Distribution(NamedTuple):
         )
         return selected[0] if scalar_idx else selected
 
+    def get_resonant_pump_eta(self, idx=None, experiment_idx=None):
+        """Return complex dipole-frame resonant pump couplings in GHz.
+
+        Parameters
+        ----------
+        idx : int, array_like, or None, optional
+            Distribution indices. If None, return results for all members.
+            A scalar index returns shape ``(3,)``. A one-dimensional index 
+            array returns shape ``(K, 3)``.
+        experiment_idx : int or length-one array_like or None, optional
+            Distribution member used to choose the shared QWP-HWP-QWP angles.
+            The selected angles are then propagated through each ``idx``
+            member's own source polarization, PDL, mode directions, and
+            coupling rate.
+
+        Returns
+        -------
+        jax.Array, shape (..., 3)
+            Complex dipole-frame pump couplings in GHz.
+        """
+        idx_array, scalar_idx = self._prepare_indices(idx)
+        result = self._get_resonant_pump_eta_batch(
+            idx_array,
+            experiment_idx=experiment_idx,
+        )
+        return result[0] if scalar_idx else result
+
+    @jax.jit
+    def _get_resonant_pump_eta_batch(self, idx, experiment_idx=None):
+        """Return complex dipole-frame pump couplings, shape (N, 3), in GHz.
+
+        If ``experiment_idx`` is supplied, its optimal waveplate angles are
+        shared across the full ``idx`` batch. All optical-device parameters
+        remain resolved by ``idx`` so that each model member predicts the
+        realized coupling under those common physical settings.
+        """
+        idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
+        if idx.ndim != 1:
+            raise ValueError("`idx` must be a one-dimensional integer array.")
+
+        experiment_idx = self._prepare_experiment_index(experiment_idx)
+
+        # Initial Jones vector in the TE/TM basis:
+        #
+        #     [cos(alpha), exp(i * phase) sin(alpha)].
+        pump_alpha = self.resonant_pump_polarization[idx]
+        pump_phase = self.resonant_pump_phase[idx]
+        polarization = jnp.stack(
+            [
+                jnp.cos(pump_alpha),
+                jnp.exp(1j * pump_phase) * jnp.sin(pump_alpha),
+            ],
+            axis=-1,
+        )
+
+        # QWP-HWP-QWP settings that produce the required pre-PDL state.
+        if experiment_idx is None:
+            waveplate_angles = self.get_waveplate_angles_batch(idx)
+        else:
+            shared_waveplate_angles = self.get_waveplate_angles_batch(
+                experiment_idx
+            )[0]
+            waveplate_angles = jnp.broadcast_to(
+                shared_waveplate_angles,
+                (idx.shape[0], shared_waveplate_angles.shape[0]),
+            )
+
+        def waveplate_jones(theta, delta):
+            """Return W(theta, delta) for a batch of waveplate angles."""
+            c = jnp.cos(theta)
+            s = jnp.sin(theta)
+            phase_delay = jnp.exp(
+                1j * jnp.asarray(delta, dtype=theta.dtype)
+            )
+
+            return jnp.stack(
+                [
+                    jnp.stack(
+                        [
+                            c**2 + phase_delay * s**2,
+                            c * s * (1.0 - phase_delay),
+                        ],
+                        axis=-1,
+                    ),
+                    jnp.stack(
+                        [
+                            c * s * (1.0 - phase_delay),
+                            s**2 + phase_delay * c**2,
+                        ],
+                        axis=-1,
+                    ),
+                ],
+                axis=-2,
+            )
+
+        QWP1 = waveplate_jones(
+            waveplate_angles[:, 0],
+            0.5 * jnp.pi,
+        )
+        HWP = waveplate_jones(
+            waveplate_angles[:, 1],
+            jnp.pi,
+        )
+        QWP2 = waveplate_jones(
+            waveplate_angles[:, 2],
+            0.5 * jnp.pi,
+        )
+
+        # eta_final = QWP2 @ HWP @ QWP1 @ eta_initial.
+        polarization = jnp.einsum(
+            "nij,nj->ni",
+            QWP1,
+            polarization,
+        )
+        polarization = jnp.einsum(
+            "nij,nj->ni",
+            HWP,
+            polarization,
+        )
+        polarization = jnp.einsum(
+            "nij,nj->ni",
+            QWP2,
+            polarization,
+        )
+
+        # The waveplates are unitary. This only removes numerical roundoff.
+        polarization = polarization / jnp.linalg.norm(
+            polarization,
+            axis=-1,
+            keepdims=True,
+        )
+
+        # TE/TM electric-field directions in crystal coordinates.
+        #
+        # Shape: (N, 2, 3).
+        mode_vectors_crystal = angles_to_cartesian(
+            self.mode_field_orientation[idx, :, 0],
+            self.mode_field_orientation[idx, :, 1],
+        )
+
+        # Construct the local SnV dipole frame.
+        dipole_z_crystal = jnp.asarray(
+            self.constants.dipole_crystal_axes,
+            dtype=mode_vectors_crystal.dtype,
+        )[self.dipole_crystal_axis_idx[idx]]
+
+        dipole_to_crystal = _dipole_basis_crystal_from_axis(
+            dipole_z_crystal
+        )
+
+        # Under the row-vector convention used elsewhere in the class,
+        #
+        #     v_dipole = v_crystal @ dipole_to_crystal.
+        #
+        # Shape: (N, 2, 3).
+        mode_vectors_dipole = jnp.matmul(
+            mode_vectors_crystal,
+            dipole_to_crystal,
+        )
+
+        # PDL is a power ratio, so sqrt(PDL) is the corresponding
+        # field-amplitude factor for the TM mode.
+        pdl = self.resonant_pump_pdl_ratio[idx]
+        pdl_amplitude = jnp.stack(
+            [
+                jnp.ones_like(pdl),
+                jnp.sqrt(pdl),
+            ],
+            axis=-1,
+        )
+
+        # Complex TE/TM coupling amplitudes:
+        #
+        #     [
+        #         Omega_TE * eta_TE,
+        #         Omega_TE * sqrt(PDL) * eta_TM,
+        #     ].
+        #
+        # Shape: (N, 2).
+        mode_couplings = (
+            self.resonant_pump_coupling_rate[idx][:, None]
+            * polarization
+            * pdl_amplitude
+        )
+
+        # Coherently combine TE and TM in the local dipole frame:
+        #
+        #     pump_eta =
+        #         Omega_TE * eta_TE * e_TE
+        #         + Omega_TE * sqrt(PDL) * eta_TM * e_TM.
+        #
+        # Do not normalize this vector. Its magnitude carries the physical
+        # optical coupling in GHz.
+        return jnp.sum(
+            mode_couplings[..., None] * mode_vectors_dipole,
+            axis=-2,
+        )
+
     @jax.jit(
         static_argnames=(
             "max_bessel_order",
@@ -799,200 +1148,239 @@ class SnV120Distribution(NamedTuple):
         bessel_series_terms: int = 48,
         sum_counts: bool = True,
     ):
-        """Calculate optical scattering rates for an EOM-frequency sweep.
+        """Calculate transition- and sideband-resolved scattering rates.
 
-        The optical field is treated as a phase-modulated carrier with sidebands
-        at integer multiples of ``eom_frequency``. The contribution from each
-        sideband is calculated independently and may optionally be summed over
-        both sidebands and optical transitions.
+        The retained optical transitions are the same four matched lower-orbital
+        transitions used by get_ple_freqs:
 
-        Parameters
-        ----------
-        idx : jax.Array
-            One-dimensional array containing the selected distribution indices.
-            If ``N`` particles are selected, this array has shape ``(N,)``.
+            ground state t -> excited state t, t = 0, 1, 2, 3.
 
-        eom_frequency : float or jax.Array, optional
-            EOM modulation frequency in GHz.
+        For transition t, the carrier coupling is calculated from the actual
+        dipole matrix element:
 
-            A scalar input is converted into a frequency sweep of length one. An
-            array input must be one-dimensional and is interpreted as a frequency
-            sweep with shape ``(F,)``.
+            Omega_t^2 =
+                |sum_j pump_eta[j] <exc_t|p_j|gnd_t>|^2.
 
-            Every frequency in the sweep is evaluated for every selected
-            distribution member.
+        Sideband n therefore has squared coupling
 
-        max_bessel_order : int, optional
-            Largest positive and negative EOM sideband order to include. Included
-            sideband orders are
-
-            ``-max_bessel_order, ..., 0, ..., +max_bessel_order``.
-
-            This argument must be static under ``jax.jit`` because it determines
-            the number of sidebands and therefore the compiled array shapes.
-
-        bessel_series_terms : int, optional
-            Number of terms retained in the pure-JAX Bessel-function series.
-
-            This argument must be static under ``jax.jit``.
-
-        sum_counts : bool, optional
-            If ``True``, sum the scattering rates over the sideband and transition
-            axes. If ``False``, return the individual contribution from every
-            sideband and optical transition.
-
-            This argument must be static under ``jax.jit`` because it changes the
-            output shape.
+            Omega_n,t^2 = J_n(beta)^2 * Omega_t^2.
 
         Returns
         -------
         jax.Array
-            If ``sum_counts=True``, returns an array with shape ``(N, F)``.
+            If sum_counts=True:
+                shape (N, F)
 
-            If ``sum_counts=False``, returns an array with shape
-            ``(N, F, S, T)``, where
+            If sum_counts=False:
+                shape (N, F, S, 4)
 
-            - ``N`` is the number of selected distribution members,
-            - ``F`` is the number of EOM frequencies,
-            - ``S = 2 * max_bessel_order + 1`` is the number of sidebands,
-            - ``T`` is the number of optical transitions.
-
-        Notes
-        -----
-        A scalar ``eom_frequency`` is deliberately retained as a length-one
-        frequency sweep, so the second output axis is always the frequency axis.
+            where F is the number of EOM frequencies and
+            S = 2 * max_bessel_order + 1.
         """
-        # Normalize the distribution indices to a one-dimensional integer array.
-        #
-        # Shape: (N,)
         idx = jnp.atleast_1d(
             jnp.asarray(idx, dtype=jnp.int32)
         )
-
-        # Normalize the EOM frequency to a one-dimensional sweep.
-        #
-        # Scalar input:
-        #     () -> (1,)
-        #
-        # Sweep input:
-        #     (F,) -> (F,)
         eom_frequency = jnp.atleast_1d(
             jnp.asarray(eom_frequency)
         )
 
-        # Homogeneous optical linewidth for each selected distribution member.
-        #
-        # The excited-state lifetime is stored in ns, so its inverse has units
-        # of GHz. Division by 2*pi converts the decay rate to an ordinary-frequency
-        # linewidth under the convention used by the scattering-rate expression.
-        #
-        # Shape: (N,)
+        if idx.ndim != 1:
+            raise ValueError(
+                "`idx` must be a one-dimensional integer array."
+            )
+        if eom_frequency.ndim != 1:
+            raise ValueError(
+                "`eom_frequency` must be scalar or one-dimensional."
+            )
+
+        lifetime = self.excited_state_lifetime[idx]
+
+        # The lifetime is in ns, so 1/lifetime is in GHz. This preserves the
+        # ordinary-frequency linewidth convention used by the existing rate
+        # expression.
         gamma = (
             1.0
-            / self.excited_state_lifetime[idx]
+            / lifetime
             / (2.0 * jnp.pi)
         )
 
-        # Unmodulated optical coupling rate for each selected distribution member.
+        # Complex pump coupling in the local dipole frame.
         #
-        # Shape: (N,)
-        omega = jnp.sum(
-            self.resonant_pump_coupling_rate[idx]
-            * self.constants.resonant_pump_polarization_target[None, :],
-            axis=-1,
+        # This already includes:
+        #   - initial TE/TM polarization and phase,
+        #   - QWP-HWP-QWP propagation,
+        #   - PDL,
+        #   - resonant_pump_coupling_rate,
+        #   - TE/TM mode directions.
+        #
+        # Shape: (N, 3).
+        pump_eta = self._get_resonant_pump_eta_batch(idx)
+
+        # Static Hamiltonian inputs.
+        B, theta, phi = self.get_B_spherical_batch(
+            idx,
+            frame="dipole",
         )
-        # Low-frequency EOM voltage-to-Vpi ratio.
-        #
-        # Shape: (N,)
-        unfiltered_vpi_ratio = self.eom_vpi_ratio[idx]
+        neighbor_idx = self.hyperfine_neighbor_idx[idx]
 
-        # EOM Vpi response bandwidth.
-        #
-        # Shape: (N,)
-        eom_bandwidth = self.eom_vpi_bandwidth[idx]
-
-        # Spin-preserving optical transition frequencies.
-        #
-        # Shape: (N, T)
-        ple_freqs = self.get_ple_freqs(idx=idx)
-
-        # Convert the target laser frequency to the same dtype as gamma.
-        laser_frequency = jnp.asarray(
-            self.constants.laser_frequency,
-            dtype=gamma.dtype,
+        delta_f_gnd = self._select_scalar_parameter_batch(
+            params.delta_f_gnd,
+            idx,
+        )
+        delta_f_exc = self._select_scalar_parameter_batch(
+            params.delta_f_exc,
+            idx,
         )
 
-        # Support either one shared laser frequency or one laser frequency per
-        # full-distribution member.
-        if laser_frequency.ndim == 0:
-            # Shared scalar laser frequency.
-            #
-            # Shape: () -> (N,)
-            laser_frequency = jnp.broadcast_to(
-                laser_frequency,
-                gamma.shape,
-            )
-        elif laser_frequency.ndim == 1:
-            # Select the laser frequency corresponding to each selected particle.
-            #
-            # Shape: (N,)
-            laser_frequency = laser_frequency[idx]
-        else:
-            raise ValueError(
-                "`laser_frequency` must be scalar or have shape (N,)."
+        def transition_data_one(
+            B_one,
+            theta_one,
+            phi_one,
+            pump_eta_one,
+            zpl_shift_one,
+            alpha_one,
+            beta_one,
+            alpha_exc_one,
+            beta_exc_one,
+            rg_one,
+            A_gnd_one,
+            Ax_gnd_one,
+            Ay_gnd_one,
+            A_exc_one,
+            Ax_exc_one,
+            Ay_exc_one,
+            delta_f_gnd_one,
+            delta_f_exc_one,
+        ):
+            (
+                E,
+                _,
+                _,
+                _,
+                E_exc,
+                _,
+                _,
+                _,
+                transition,
+                _,
+            ) = qh_jqt.PLE_transitions(
+                B=B_one,
+                theta=theta_one,
+                phi=phi_one,
+                eta_x=pump_eta_one[0],
+                eta_y=pump_eta_one[1],
+                eta_z=pump_eta_one[2],
+                alpha=alpha_one,
+                beta=beta_one,
+                alpha_exc=alpha_exc_one,
+                beta_exc=beta_exc_one,
+                rg=rg_one,
+                q_gnd=params.q,
+                A_gnd=A_gnd_one,
+                Ax_gnd=Ax_gnd_one,
+                Ay_gnd=Ay_gnd_one,
+                L_gnd=params.L,
+                upsilon_gnd=0.0,
+                delta_f_gnd=delta_f_gnd_one,
+                q_exc=params.q_exc,
+                A_exc=A_exc_one,
+                Ax_exc=Ax_exc_one,
+                Ay_exc=Ay_exc_one,
+                L_exc=params.L_exc,
+                upsilon_exc=0.0,
+                delta_f_exc=delta_f_exc_one,
             )
 
-        # Apply the finite-bandwidth EOM response independently for each frequency
-        # and each distribution member.
+            # Preserve the existing scattering-rate transition set:
+            #
+            #     g_0 -> e_0
+            #     g_1 -> e_1
+            #     g_2 -> e_2
+            #     g_3 -> e_3
+            transition_indices = jnp.arange(
+                4,
+                dtype=jnp.int32,
+            )
+
+            frequencies = (
+                E_exc[transition_indices]
+                - E[transition_indices]
+                + params.LEVEL_OFFSET
+                + zpl_shift_one
+            )
+
+            # qh_jqt.PLE_transitions calculates
+            #
+            #     transition[l, k]
+            #       = |sum_j pump_eta[j] <exc_l|p_j|gnd_k>|^2.
+            #
+            # Because pump_eta carries units of GHz, these selected elements
+            # are the transition-specific squared couplings in GHz^2.
+            coupling_squared = transition[
+                transition_indices,
+                transition_indices,
+            ]
+
+            return frequencies, coupling_squared
+
+        # Both the frequencies and dipole-resolved couplings come from the
+        # same eigensystem calculation.
         #
-        # eom_frequency[None, :] has shape (1, F).
-        # eom_bandwidth[:, None] has shape (N, 1).
+        # ple_freqs:                   (N, 4)
+        # transition_coupling_squared: (N, 4)
+        ple_freqs, transition_coupling_squared = jax.vmap(
+            transition_data_one
+        )(
+            B,
+            theta,
+            phi,
+            pump_eta,
+            self.strain_params[idx, 0],
+            self.strain_params[idx, 1],
+            self.strain_params[idx, 2],
+            self.strain_params[idx, 3],
+            self.strain_params[idx, 4],
+            params.rg[neighbor_idx],
+            params.A_GND_TENSORS[neighbor_idx],
+            params.AX_GND_TENSORS[neighbor_idx],
+            params.AY_GND_TENSORS[neighbor_idx],
+            params.A_EXC_TENSORS[neighbor_idx],
+            params.AX_EXC_TENSORS[neighbor_idx],
+            params.AY_EXC_TENSORS[neighbor_idx],
+            delta_f_gnd,
+            delta_f_exc,
+        )
+
+        # Apply the finite-bandwidth EOM response.
         #
-        # Broadcasting produces shape (N, F).
+        # Shape: (N, F).
         filtered_vpi_ratio = (
-            unfiltered_vpi_ratio[:, None]
+            self.eom_vpi_ratio[idx, None]
             / jnp.sqrt(
                 1.0
                 + (
                     eom_frequency[None, :]
-                    / eom_bandwidth[:, None]
+                    / self.eom_vpi_bandwidth[idx, None]
                 ) ** 2
             )
         )
 
-        # Phase-modulation index beta = pi * Vmax / Vpi.
+        # Phase-modulation index beta = pi * Vmax/Vpi.
         #
-        # Shape: (N, F)
+        # Shape: (N, F).
         modulation_index = (
             jnp.pi * filtered_vpi_ratio
         )
 
-        # Integer sideband orders.
-        #
-        # Shape: (S,), where S = 2 * max_bessel_order + 1
+        # Shape: (S,).
         sideband_orders = jnp.arange(
             -max_bessel_order,
             max_bessel_order + 1,
             dtype=gamma.dtype,
         )
 
-        # The Bessel helper calculates only nonnegative integer orders. Negative
-        # orders use the same squared magnitude because
-        #
-        # J_{-n}(beta) = (-1)^n J_n(beta).
-        #
-        # Shape: (S,)
-        abs_sideband_orders = jnp.abs(
-            sideband_orders
-        ).astype(jnp.int32)
-
-        # Calculate J_n(beta) for n = 0, ..., max_bessel_order.
-        #
-        # Input shape:
-        #     modulation_index: (N, F)
-        #
-        # Output shape:
-        #     (max_bessel_order + 1, N, F)
+        # Shape:
+        #     (max_bessel_order + 1, N, F).
         J_nonnegative = (
             _bessel_j_nonnegative_orders_integer_series(
                 modulation_index,
@@ -1001,100 +1389,81 @@ class SnV120Distribution(NamedTuple):
             )
         )
 
-        # Select the Bessel coefficient associated with each positive and negative
-        # sideband order.
+        # J_{-n}(beta) differs only by a sign for integer n, so its squared
+        # amplitude equals that of J_n(beta).
         #
-        # After jnp.take:
-        #     (S, N, F)
-        #
-        # After jnp.moveaxis:
-        #     (N, F, S)
+        # Shape: (N, F, S).
         J_sidebands = jnp.moveaxis(
             jnp.take(
                 J_nonnegative,
-                abs_sideband_orders,
+                jnp.abs(sideband_orders).astype(jnp.int32),
                 axis=0,
             ),
             0,
             -1,
         )
 
-        # Effective squared optical coupling for each sideband.
+        # Apply each sideband coefficient to each transition-specific coupling:
         #
-        # omega[:, None, None] has shape (N, 1, 1).
-        # J_sidebands has shape (N, F, S).
+        #     Omega_n,t^2 = J_n(beta)^2 * Omega_t^2.
         #
-        # Output shape: (N, F, S)
+        # Shape: (N, F, S, 4).
         sideband_coupling_squared = (
-            omega[:, None, None] ** 2
-            * J_sidebands**2
+            J_sidebands[..., None] ** 2
+            * transition_coupling_squared[:, None, None, :]
         )
 
-        # Optical frequency of each EOM sideband.
-        #
-        # laser_frequency[:, None, None] has shape (N, 1, 1).
-        # eom_frequency[None, :, None] has shape (1, F, 1).
-        # sideband_orders[None, None, :] has shape (1, 1, S).
-        #
-        # Output shape: (N, F, S)
+        laser_frequency = jnp.asarray(
+            self.constants.laser_frequency,
+            dtype=gamma.dtype,
+        )
+
+        if laser_frequency.ndim == 0:
+            laser_frequency = jnp.broadcast_to(
+                laser_frequency,
+                gamma.shape,
+            )
+        elif laser_frequency.ndim == 1:
+            laser_frequency = laser_frequency[idx]
+        else:
+            raise ValueError(
+                "`laser_frequency` must be scalar or have shape (N,)."
+            )
+
+        # Shape: (N, F, S).
         sideband_frequencies = (
             laser_frequency[:, None, None]
             + eom_frequency[None, :, None]
             * sideband_orders[None, None, :]
         )
 
-        # Detuning between every EOM sideband and every optical transition.
-        #
-        # sideband_frequencies[..., None] has shape (N, F, S, 1).
-        # ple_freqs[:, None, None, :] has shape (N, 1, 1, T).
-        #
-        # Output shape: (N, F, S, T)
+        # Shape: (N, F, S, 4).
         detuning = (
             sideband_frequencies[..., None]
             - ple_freqs[:, None, None, :]
         )
 
-        # Expand gamma across frequency, sideband, and transition axes.
+        # The dipole-resolved coupling enters both the numerator and the
+        # power-broadening term in the denominator.
         #
-        # Shape: (N, 1, 1, 1)
-        gamma_expanded = gamma[:, None, None, None]
-
-        # Expand the squared sideband coupling across the transition axis.
-        #
-        # Shape: (N, F, S, 1)
-        coupling_expanded = (
-            sideband_coupling_squared[..., None]
-        )
-
-        # Saturated Lorentzian scattering rate for every frequency, particle,
-        # sideband, and optical transition.
-        #
-        # Shape: (N, F, S, T)
+        # Shape: (N, F, S, 4).
         sideband_rates = (
-            coupling_expanded
-            / self.excited_state_lifetime[idx, None, None, None]
+            sideband_coupling_squared
+            / lifetime[:, None, None, None]
             / (
-                gamma_expanded**2
-                + 2.0 * coupling_expanded
+                gamma[:, None, None, None] ** 2
+                + 2.0 * sideband_coupling_squared
                 + 4.0 * detuning**2
             )
         )
 
         if sum_counts:
-            # Sum over the sideband and transition axes.
-            #
-            # Input shape:  (N, F, S, T)
-            # Output shape: (N, F)
             return jnp.sum(
                 sideband_rates,
                 axis=(-2, -1),
             )
 
-        # Return the complete sideband- and transition-resolved scattering rates.
-        #
-        # Shape: (N, F, S, T)
         return sideband_rates
-
 
     def scattering_rate(
         self,
@@ -1197,9 +1566,9 @@ class SnV120Distribution(NamedTuple):
         """Solve the static Hamiltonian for a one-dimensional particle batch.
 
         ``ground_state`` is static because it selects different constants and
-        parameter arrays. ``experiment_idx`` is dynamic; ``None`` and a scalar
-        index trace as two different pytree structures without making every
-        index value a separate compilation-cache key.
+        parameter arrays. ``experiment_idx`` selects one member's optimal
+        vector-magnet settings; those physical settings are then applied to all
+        members in ``idx`` using each member's own magnet calibration.
 
         The backend evaluates one parameter point at a time.  This method maps
         that scalar backend over the selected distribution members and supplies
@@ -1214,8 +1583,8 @@ class SnV120Distribution(NamedTuple):
             A = params.A_GND_TENSORS[self.hyperfine_neighbor_idx[idx]]
             Ax = params.AX_GND_TENSORS[self.hyperfine_neighbor_idx[idx]]
             Ay = params.AY_GND_TENSORS[self.hyperfine_neighbor_idx[idx]]
-            alpha = self.alpha[idx]
-            beta = self.beta[idx]
+            alpha = self.strain_params[idx, 1]
+            beta = self.strain_params[idx, 2]
             delta_f = self._select_scalar_parameter_batch(
                 params.delta_f_gnd,
                 idx,
@@ -1226,51 +1595,30 @@ class SnV120Distribution(NamedTuple):
             A = params.A_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]]
             Ax = params.AX_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]]
             Ay = params.AY_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]]
-            alpha = self.alpha_exc[idx]
-            beta = self.beta_exc[idx]
+            alpha = self.strain_params[idx, 3]
+            beta = self.strain_params[idx, 4]
             delta_f = self._select_scalar_parameter_batch(
                 params.delta_f_exc,
                 idx,
             )
 
-        if experiment_idx is not None:
-            experiment_idx = jnp.atleast_1d(
-                jnp.asarray(experiment_idx, dtype=jnp.int32)
-            )
-            B, theta, phi = self.get_B_spherical_batch(
-                experiment_idx,
-                frame="dipole",
-            )
-            B = B[0]
-            theta = theta[0]
-            phi = phi[0]
-            in_axes = (
-                None, None, None,
-                0, None,
-                0, 0, 0,
-                None,
-                0, 0,
-                None,
-                0,
-            )
-        else:
-            B, theta, phi = self.get_B_spherical_batch(
-                idx,
-                frame="dipole",
-            )
-            in_axes = (
-                0, 0, 0,
-                0, None,
-                0, 0, 0,
-                None,
-                0, 0,
-                None,
-                0,
-            )
+        B, theta, phi = self.get_B_spherical_batch(
+            idx,
+            frame="dipole",
+            experiment_idx=experiment_idx,
+        )
 
         return jax.vmap(
             qh_jqt.solve_hamiltonian,
-            in_axes=in_axes,
+            in_axes=(
+                0, 0, 0,
+                0, None,
+                0, 0, 0,
+                None,
+                0, 0,
+                None,
+                0,
+            ),
         )(
             B,
             theta,
@@ -1353,53 +1701,19 @@ class SnV120Distribution(NamedTuple):
             idx,
         )
 
-        if experiment_idx is not None:
-            experiment_idx = jnp.atleast_1d(
-                jnp.asarray(experiment_idx, dtype=jnp.int32)
-            )
-            B, theta, phi = self.get_B_spherical_batch(
-                experiment_idx,
-                frame="dipole",
-            )
-            return jax.vmap(
-                calculate_one,
-                in_axes=(
-                    None, None, None,
-                    0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0,
-                    0, 0,
-                ),
-            )(
-                B[0],
-                theta[0],
-                phi[0],
-                self.alpha[idx],
-                self.beta[idx],
-                self.alpha_exc[idx],
-                self.beta_exc[idx],
-                params.rg[self.hyperfine_neighbor_idx[idx]],
-                params.A_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
-                params.AX_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
-                params.AY_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
-                params.A_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]],
-                params.AX_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]],
-                params.AY_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]],
-                delta_f_gnd,
-                delta_f_exc,
-            )
-
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
+            experiment_idx=experiment_idx,
         )
         return jax.vmap(calculate_one)(
             B,
             theta,
             phi,
-            self.alpha[idx],
-            self.beta[idx],
-            self.alpha_exc[idx],
-            self.beta_exc[idx],
+            self.strain_params[idx, 1],
+            self.strain_params[idx, 2],
+            self.strain_params[idx, 3],
+            self.strain_params[idx, 4],
             params.rg[self.hyperfine_neighbor_idx[idx]],
             params.A_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
             params.AX_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
@@ -1439,7 +1753,7 @@ class SnV120Distribution(NamedTuple):
         )
 
         # Spin-preserving ground-orbital transition frequencies.
-        return E_exc[..., :4] - E[..., :4] + params.LEVEL_OFFSET
+        return E_exc[..., :4] - E[..., :4] + params.LEVEL_OFFSET + self.strain_params[idx, 0]
 
     def get_emr_freqs(self, idx=None, experiment_idx=None):
         """
@@ -1493,23 +1807,31 @@ class SnV120Distribution(NamedTuple):
             "`get_init_timestep` needs a specified pumping/decay model before "
             "a physically meaningful time step can be calculated."
         )
-
     @jax.jit(static_argnames=("included_states",))
-    def get_excitation_hamiltonian_batch(self, idx, included_states=None):
+    def get_excitation_hamiltonian_batch(
+        self,
+        idx,
+        included_states=None,
+        experiment_idx=None,
+    ):
         """Construct dynamic Hamiltonians for a one-dimensional index batch.
 
-        ``included_states`` must be ``None`` or a hashable static value such as
-        a tuple, because it changes the returned operator structure.  The public
-        frontend continues to accept the existing two-angle optical and
-        microwave orientation representations; this adapter converts them to
-        the scalar Cartesian/angular components required by the backend.
+        The resonant-pump vector is built by
+        :meth:`_get_resonant_pump_eta_batch`, so the dynamic Hamiltonian and
+        scattering-rate model use exactly the same QWP-HWP-QWP, PDL, TE/TM
+        mode-direction, and coupling-rate handling.
+
+        If ``experiment_idx`` is supplied, its optimal vector-magnet settings
+        and QWP-HWP-QWP angles are used for every selected distribution member.
+        Each member in ``idx`` still contributes its own physical calibration
+        and Hamiltonian parameters.
         """
+
         def calculate_one(
             B,
             theta,
             phi,
-            laser_frequency,
-            resonant_pump_polarization,
+            pump_eta,
             excited_state_lifetime,
             B_drive_strength,
             B_drive_orientation,
@@ -1527,19 +1849,11 @@ class SnV120Distribution(NamedTuple):
             delta_f_gnd,
             delta_f_exc,
         ):
-            # Preserve the previous frontend convention: the two pump values
-            # are interpreted as spherical (theta, phi) angles and converted to
-            # Cartesian dipole components before entering the scalar backend.
-            pump_eta = angles_to_cartesian(
-                resonant_pump_polarization[0],
-                resonant_pump_polarization[1],
-            )
-
             return qh_jqt.get_dynamic_hamiltonian(
                 B=B,
                 theta=theta,
                 phi=phi,
-                excited_ground_split=params.LEVEL_OFFSET - laser_frequency,
+                excited_ground_split=0,
                 excited_state_lifetime=excited_state_lifetime,
                 pump_eta_x=pump_eta[0],
                 pump_eta_y=pump_eta[1],
@@ -1564,22 +1878,20 @@ class SnV120Distribution(NamedTuple):
             )
 
         idx = jnp.asarray(idx, dtype=jnp.int32)
+        if idx.ndim != 1:
+            raise ValueError("`idx` must be a one-dimensional integer array.")
+
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
+            experiment_idx=experiment_idx,
+        )
+        pump_eta = self._get_resonant_pump_eta_batch(
+            idx,
+            experiment_idx=experiment_idx,
         )
 
-        laser_frequency = self._select_scalar_parameter_batch(
-            self.constants.laser_frequency,
-            idx,
-        )
-        resonant_pump_polarization = jnp.asarray(
-            self.constants.resonant_pump_polarization_target
-        )
-        resonant_pump_polarization = jnp.broadcast_to(
-            resonant_pump_polarization,
-            (idx.shape[0], resonant_pump_polarization.shape[0]),
-        )
+        neighbor_idx = self.hyperfine_neighbor_idx[idx]
         delta_f_gnd = self._select_scalar_parameter_batch(
             params.delta_f_gnd,
             idx,
@@ -1593,27 +1905,31 @@ class SnV120Distribution(NamedTuple):
             B,
             theta,
             phi,
-            laser_frequency,
-            resonant_pump_polarization,
+            pump_eta,
             self.excited_state_lifetime[idx],
             self.mw_B_magnitude[idx],
             self.mw_B_orientation[idx],
-            self.alpha[idx],
-            self.beta[idx],
-            self.alpha_exc[idx],
-            self.beta_exc[idx],
-            params.rg[self.hyperfine_neighbor_idx[idx]],
-            params.A_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
-            params.AX_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
-            params.AY_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
-            params.A_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]],
-            params.AX_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]],
-            params.AY_EXC_TENSORS[self.hyperfine_neighbor_idx[idx]],
+            self.strain_params[idx, 1],
+            self.strain_params[idx, 2],
+            self.strain_params[idx, 3],
+            self.strain_params[idx, 4],
+            params.rg[neighbor_idx],
+            params.A_GND_TENSORS[neighbor_idx],
+            params.AX_GND_TENSORS[neighbor_idx],
+            params.AY_GND_TENSORS[neighbor_idx],
+            params.A_EXC_TENSORS[neighbor_idx],
+            params.AX_EXC_TENSORS[neighbor_idx],
+            params.AY_EXC_TENSORS[neighbor_idx],
             delta_f_gnd,
             delta_f_exc,
         )
 
-    def get_excitation_hamiltonian(self, idx=None, included_states=None):
+    def get_excitation_hamiltonian(
+        self,
+        idx=None,
+        included_states=None,
+        experiment_idx=None,
+    ):
         scalar = idx is not None and jnp.asarray(idx).ndim == 0
 
         if idx is None:
@@ -1621,7 +1937,11 @@ class SnV120Distribution(NamedTuple):
         else:
             idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
 
-        result = self.get_excitation_hamiltonian_batch(idx, included_states)
+        result = self.get_excitation_hamiltonian_batch(
+            idx,
+            included_states=included_states,
+            experiment_idx=experiment_idx,
+        )
 
         if scalar:
             return jax.tree_util.tree_map(lambda x: x[0], result)
@@ -1631,13 +1951,22 @@ class SnV120Distribution(NamedTuple):
 
     
     @jax.jit(static_argnames=("included_states",))
-    def get_ground_hamiltonian_batch(self, idx, included_states=None):
+    def get_ground_hamiltonian_batch(
+        self,
+        idx,
+        included_states=None,
+        experiment_idx=None,
+    ):
         """Construct ground-state Hamiltonians for an index batch.
 
         ``included_states`` must be ``None`` or a hashable static value such as
         a tuple, because it changes the returned operator structure.  The
         frontend retains its two-angle microwave orientation while this adapter
         passes separate scalar angles to the backend.
+
+        If ``experiment_idx`` is supplied, its optimal vector-magnet settings
+        are applied to every selected distribution member using that member's
+        own magnet calibration.
         """
         def calculate_one(
             B,
@@ -1674,6 +2003,7 @@ class SnV120Distribution(NamedTuple):
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
+            experiment_idx=experiment_idx,
         )
         delta_f_gnd = self._select_scalar_parameter_batch(
             params.delta_f_gnd,
@@ -1686,8 +2016,8 @@ class SnV120Distribution(NamedTuple):
             phi,
             self.mw_B_magnitude[idx],
             self.mw_B_orientation[idx],
-            self.alpha[idx],
-            self.beta[idx],
+            self.strain_params[idx, 1],
+            self.strain_params[idx, 2],
             params.rg[self.hyperfine_neighbor_idx[idx]],
             params.A_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
             params.AX_GND_TENSORS[self.hyperfine_neighbor_idx[idx]],
@@ -1695,7 +2025,12 @@ class SnV120Distribution(NamedTuple):
             delta_f_gnd,
         )
 
-    def get_ground_hamiltonian(self, idx=None, included_states=None):
+    def get_ground_hamiltonian(
+        self,
+        idx=None,
+        included_states=None,
+        experiment_idx=None,
+    ):
         scalar = idx is not None and jnp.asarray(idx).ndim == 0
 
         if idx is None:
@@ -1703,7 +2038,11 @@ class SnV120Distribution(NamedTuple):
         else:
             idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
 
-        result = self.get_ground_hamiltonian_batch(idx, included_states)
+        result = self.get_ground_hamiltonian_batch(
+            idx,
+            included_states=included_states,
+            experiment_idx=experiment_idx,
+        )
 
         if scalar:
             return jax.tree_util.tree_map(lambda x: x[0], result)
@@ -1720,7 +2059,8 @@ class SnV120Distribution(NamedTuple):
         included_states,
         saveat_final_only=False,
         solver_options_args=None,
-        scale=1e9
+        scale=1e9,
+        experiment_idx=None,
     ):
         """Run Hamiltonian evolutions for a batch of distribution indices.
 
@@ -1733,6 +2073,8 @@ class SnV120Distribution(NamedTuple):
             tau: Fixed-shape time array in seconds.
             psi0: Initial quantum state shared by all distribution members.
             included_states: Static tuple identifying the included eigenstates.
+            experiment_idx: Distribution member whose optimal vector-magnet
+                settings are applied to every member in ``idx``.
 
         Returns:
             A tuple ``(states, filter_states, populations)`` where every array leaf
@@ -1792,6 +2134,7 @@ class SnV120Distribution(NamedTuple):
             H0, Hb = self.get_ground_hamiltonian(
                 idx=single_idx,
                 included_states=included_states,
+                experiment_idx=experiment_idx,
             )
 
             H0_rads_s = 2.0 * jnp.pi * H0 * scale
@@ -1804,7 +2147,7 @@ class SnV120Distribution(NamedTuple):
                 * scale
             )
 
-            states, filter_states = jqt.sesolve_components(
+            states, filter_states = sesolve_components(
                 hamiltonians=(
                     H0_rads_s,
                     Hb_rads_s,
@@ -1851,7 +2194,8 @@ class SnV120Distribution(NamedTuple):
         psi0=None,
         saveat_final_only=False,
         solver_options_args=None,
-        scale=1e9
+        scale=1e9,
+        experiment_idx=None,
     ):
         """Construct the time grid and run one or more Hamiltonian evolutions.
 
@@ -1862,6 +2206,8 @@ class SnV120Distribution(NamedTuple):
             included_states: Tuple identifying the included eigenstates.
             psi0: Initial quantum state. Defaults to the first basis state.
             scale: Scale factor for the time array.
+            experiment_idx: Distribution member whose optimal vector-magnet
+                settings are applied to every member selected by ``idx``.
         Returns:
             A tuple containing the quantum states, filter states, and populations.
 
@@ -1897,6 +2243,7 @@ class SnV120Distribution(NamedTuple):
             saveat_final_only=saveat_final_only,
             solver_options_args=solver_options_args,
             scale=scale,
+            experiment_idx=experiment_idx,
         )
 
         if scalar_idx:
@@ -1913,3 +2260,708 @@ class SnV120Distribution(NamedTuple):
 
         return states, filter_states, populations
 
+
+    @jax.jit(static_argnames=("included_states", "saveat_final_only", "solver_options_args"))
+    def _drive_excitation_hamiltonian_batch(
+        self,
+        optical_pulse,
+        idx,
+        tau,
+        rho0,
+        included_states,
+        saveat_final_only=False,
+        solver_options_args=None,
+        scale=1e9,
+        experiment_idx=None,
+    ):
+        """Run Hamiltonian evolutions for a batch of distribution indices.
+
+        Each distribution member is solved independently, and the results are
+        stacked along a leading batch dimension.
+
+        Args:
+            optical_pulse: Analog pulse to apply to the optical hamiltonian.
+            b_pulse: Analog pulse to apply to the magnetic field hamiltonian.
+            idx: One-dimensional array of distribution member indices.
+            tau: Fixed-shape time array in seconds.
+            psi0: Initial quantum state shared by all distribution members.
+            included_states: Static tuple identifying the included eigenstates.
+            experiment_idx: Distribution member whose optimal vector-magnet
+                and waveplate settings are applied to every member in ``idx``.
+
+        Returns:
+            A tuple ``(states, filter_states, populations)`` where every array leaf
+            has a leading batch dimension corresponding to ``idx``.
+        """
+        idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
+
+        dimension = len(included_states)*2 +1
+        sampling_rate = jnp.asarray(self.constants.sampling_rate)*scale
+        sample_period = 1.0 / sampling_rate
+        pulse_center = optical_pulse.length / 2
+
+        # These are static because included_states is static.
+        projectors = tuple(
+            jqt.basis(dimension, state_index).to_dm()
+            for state_index in range(dimension)
+        )
+        if saveat_final_only:
+            saveat_tlist = tau[-2:]#SaveAt(t1=True)
+        else:
+            saveat_tlist = tau
+        if solver_options_args is None:
+            solver_options = jqt.SolverOptions.create(
+                progress_meter=False,
+                solver="Dopri5",
+                rtol=1e-5,
+                atol=1e-7,
+            )
+        else:
+            solver_options = jqt.SolverOptions.create(*solver_options_args)
+
+        def solve_single(single_idx):
+            """Solve the evolution for one scalar distribution index."""
+            H0, Hb, Hs_optical, c_ops = self.get_excitation_hamiltonian(
+                idx=single_idx,
+                included_states=included_states,
+                experiment_idx=experiment_idx,
+            )
+            omega_r = 2*jnp.pi*(params.LEVEL_OFFSET - self.constants.laser_frequency + self.strain_params[single_idx, 0]) * scale
+
+            # This coefficient is identical for every distribution member. Only the
+            # Hamiltonians and filter cutoff frequency depend on the member index.
+            def H_optical_drive(t, args=None):
+                del args
+
+                local_times = jnp.stack(
+                    (
+                        t - sample_period,
+                        t,
+                        t + sample_period,
+                    )
+                )
+
+                waveform, _, _ = synthesize_analog_pulse(
+                    pulse=optical_pulse,
+                    tau=local_times,
+                    at_time=pulse_center,
+                    dphase=0.0,
+                    all_info=True,
+                )
+
+                return waveform[1]*jnp.exp(-1j*omega_r*t)
+            def H_dag_optical_drive(t, args=None):
+                return jnp.conj(H_optical_drive(t, args))
+            H0_rads_s = 2.0 * jnp.pi * H0 * scale
+            Hb_rads_s = 2.0 * jnp.pi * Hb * scale
+            Hs_optical_rads_s = [
+                2.0*jnp.pi*Hs_optical[0] * scale,
+                2.0*jnp.pi*Hs_optical[1] * scale,
+            ]
+            c_ops = c_ops * jnp.sqrt(scale)
+
+            omega_c = (
+                2.0
+                * jnp.pi
+                * self.eom_vpi_bandwidth[single_idx]
+                * scale
+            )
+            states, filter_states = mesolve_components(
+                hamiltonians=(
+                    H0_rads_s,
+                    Hs_optical_rads_s[0],
+                    Hs_optical_rads_s[1],
+                ),
+                coefficients=(
+                    1.0,
+                    H_optical_drive,
+                    H_dag_optical_drive,
+                ),
+                rho0=rho0,
+                tlist=tau,
+                saveat_tlist=saveat_tlist,
+                filters=(
+                    None,
+                    lowpass_filter(omega_c, +omega_r),
+                    lowpass_filter(omega_c, -omega_r),
+                ),
+                filter_y0s=(
+                    None,
+                    jnp.asarray(0.0, dtype=jnp.complex128),
+                    jnp.asarray(0.0, dtype=jnp.complex128),
+                ),
+                collapse_operators=c_ops,
+                return_filter_states=True,
+                solver_options=solver_options,
+            )
+
+            populations = jnp.stack(
+                tuple(
+                    jnp.real(jqt.overlap(projector, states))
+                    for projector in projectors
+                ),
+                axis=0,
+            )
+
+            return states, filter_states, populations
+
+        # Each invocation receives a scalar index. All output array leaves are
+        # stacked along axis 0.
+        return jax.vmap(solve_single, in_axes=0, out_axes=0)(idx)
+
+
+    def drive_excitation_hamiltonian(
+        self,
+        idx,
+        optical_pulse,
+        included_states=(0, 1, 2, 3),
+        rho0=None,
+        saveat_final_only=False,
+        solver_options_args=None,
+        scale=1e9,
+        experiment_idx=None,
+    ):
+        """Construct the time grid and run one or more Hamiltonian evolutions.
+
+        Args:
+            dist: Distribution containing the Hamiltonian parameters.
+            idx: Scalar index, array of indices, or ``None`` for all members.
+            optical_pulse: Analog pulse to apply to the optical axis.
+            included_states: Tuple identifying the included eigenstates.
+            rho0: Initial quantum state. Defaults to the first basis state.
+            scale: Scale factor for the time array.
+            experiment_idx: Distribution member whose optimal vector-magnet
+                and waveplate settings are applied to every member selected by
+                ``idx``.
+        Returns:
+            A tuple containing the quantum states, filter states, and populations.
+
+            For a scalar ``idx``, the leading batch dimension is removed. For an
+            array or ``None``, the leading dimension corresponds to distribution
+            members.
+        """
+        idx_array, scalar_idx = self._prepare_indices(idx)
+        dimension = len(included_states)*2 + 1 
+
+        if rho0 is None:
+            rho0 = jqt.ket2dm(jqt.basis(dimension, 0))
+
+        # Keep time-grid construction outside JIT because its output length is
+        # determined using Python values.
+        sampling_rate = float(
+            np.asarray(self.constants.sampling_rate)*scale
+        )
+        sample_period = 1.0 / sampling_rate
+
+        tau = make_analog_pulse_time_array(
+            pulse=optical_pulse,
+            sample_period=sample_period,
+            at_time=float(np.asarray(optical_pulse.length)) / 2.0,
+        )
+
+        states, filter_states, populations = self._drive_excitation_hamiltonian_batch(
+            optical_pulse=optical_pulse,
+            idx=idx_array,
+            tau=tau,
+            rho0=rho0,
+            included_states=tuple(included_states),
+            saveat_final_only=saveat_final_only,
+            solver_options_args=solver_options_args,
+            scale=scale,
+            experiment_idx=experiment_idx,
+        )
+
+        if scalar_idx:
+            states = states[0]
+
+            # filter_states is a pytree organized by Hamiltonian/filter component.
+            # Index every array leaf instead of indexing the outer component list.
+            filter_states = jax.tree_util.tree_map(
+                lambda leaf: leaf[0],
+                filter_states,
+            )
+
+            populations = populations[0]
+
+        return states, filter_states, populations
+    @jax.jit
+    def get_waveplate_angles_batch(self, idx):
+        """Calculate QWP-HWP-QWP angles that make the realized pump dipole
+        operator as close as possible to ``constants.target_dipole_operator``.
+
+        The TE and TM electric-field vectors span at most a two-dimensional
+        subspace of the three-component dipole-operator space. For each selected
+        distribution member, this method therefore:
+
+            1. Converts the TE/TM mode directions from crystal coordinates to
+               the local SnV dipole frame.
+            2. Orthogonally projects ``target_dipole_operator`` onto the
+               reachable TE/TM mode span using a Moore-Penrose pseudoinverse.
+            3. Converts the projected post-PDL TE/TM coefficients into the
+               pre-PDL Jones vector that the waveplates must produce.
+            4. Uses the analytic QWP-HWP-QWP construction to transform the
+               current input Jones vector into that pre-PDL target.
+
+        ``target_dipole_operator`` is interpreted in the local dipole frame.
+        Its overall magnitude is ignored because the waveplates control a
+        normalized Jones state, while ``resonant_pump_coupling_rate`` controls
+        the overall optical-coupling scale.
+
+        Returns
+        -------
+        jax.Array, shape (K, 3)
+            ``[QWP1 angle, HWP angle, QWP2 angle]`` in radians.
+        """
+        idx = jnp.asarray(idx, dtype=jnp.int32)
+
+        if idx.ndim != 1:
+            raise ValueError(
+                "`idx` must be a one-dimensional integer array."
+            )
+
+        # ------------------------------------------------------------------
+        # Input Jones vector before the waveplates
+        # ------------------------------------------------------------------
+        #
+        #     source = [cos(alpha), exp(i * phase) sin(alpha)].
+        #
+        alpha = self.resonant_pump_polarization[idx]
+        phase = self.resonant_pump_phase[idx]
+
+        source = jnp.stack(
+            [
+                jnp.cos(alpha),
+                jnp.exp(1j * phase) * jnp.sin(alpha),
+            ],
+            axis=-1,
+        )
+
+        source = source / jnp.linalg.norm(
+            source,
+            axis=-1,
+            keepdims=True,
+        )
+
+        # ------------------------------------------------------------------
+        # TE/TM mode vectors in the local dipole frame
+        # ------------------------------------------------------------------
+        #
+        # mode_field_orientation stores (theta, phi) in crystal coordinates.
+        #
+        # Shape:
+        #     mode_vectors_crystal: (K, 2, 3)
+        #
+        mode_vectors_crystal = angles_to_cartesian(
+            self.mode_field_orientation[idx, :, 0],
+            self.mode_field_orientation[idx, :, 1],
+        )
+
+        dipole_z_crystal = jnp.asarray(
+            self.constants.dipole_crystal_axes,
+            dtype=mode_vectors_crystal.dtype,
+        )[self.dipole_crystal_axis_idx[idx]]
+
+        # Columns are the local dipole-frame basis vectors expressed in
+        # crystal coordinates.
+        #
+        # Shape:
+        #     (K, 3, 3)
+        #
+        dipole_to_crystal = _dipole_basis_crystal_from_axis(
+            dipole_z_crystal
+        )
+
+        # Under the row-vector convention used by
+        # _get_resonant_pump_eta_batch,
+        #
+        #     v_dipole = v_crystal @ dipole_to_crystal.
+        #
+        # Shape:
+        #     (K, 2, 3)
+        #
+        mode_vectors_dipole = jnp.matmul(
+            mode_vectors_crystal,
+            dipole_to_crystal,
+        )
+
+        # Arrange the TE/TM vectors as columns:
+        #
+        #     M = [e_TE, e_TM].
+        #
+        # A post-PDL TE/TM coefficient vector ``a`` therefore produces
+        #
+        #     eta = M @ a.
+        #
+        # Shape:
+        #     (K, 3, 2)
+        #
+        mode_basis = jnp.swapaxes(
+            mode_vectors_dipole,
+            -1,
+            -2,
+        )
+
+        # ------------------------------------------------------------------
+        # Desired dipole operator
+        # ------------------------------------------------------------------
+        #
+        # Support either one shared target, shape (3,), or one target per
+        # complete distribution member, shape (N, 3).
+        #
+        target_dipole_operator = jnp.asarray(
+            self.constants.target_dipole_operator
+        )
+
+        if target_dipole_operator.ndim == 1:
+            if target_dipole_operator.shape[0] != 3:
+                raise ValueError(
+                    "`target_dipole_operator` must have shape "
+                    "(3,) or (N, 3)."
+                )
+
+            target_dipole_operator = jnp.broadcast_to(
+                target_dipole_operator,
+                (idx.shape[0], 3),
+            )
+
+        elif target_dipole_operator.ndim == 2:
+            if target_dipole_operator.shape[-1] != 3:
+                raise ValueError(
+                    "`target_dipole_operator` must have shape "
+                    "(3,) or (N, 3)."
+                )
+
+            target_dipole_operator = target_dipole_operator[idx]
+
+        else:
+            raise ValueError(
+                "`target_dipole_operator` must have shape "
+                "(3,) or (N, 3)."
+            )
+
+        # Preserve complex target components even though the mode-direction
+        # vectors themselves are real.
+        working_dtype = jnp.result_type(
+            source.dtype,
+            mode_basis.dtype,
+            target_dipole_operator.dtype,
+        )
+
+        source = source.astype(working_dtype)
+        mode_basis = mode_basis.astype(working_dtype)
+        target_dipole_operator = target_dipole_operator.astype(
+            working_dtype
+        )
+
+        # Only the target direction is controllable through polarization.
+        target_operator_norm = jnp.linalg.norm(
+            target_dipole_operator,
+            axis=-1,
+            keepdims=True,
+        )
+
+        safe_target_operator_norm = jnp.where(
+            target_operator_norm > 0.0,
+            target_operator_norm,
+            jnp.ones_like(target_operator_norm),
+        )
+
+        target_direction = (
+            target_dipole_operator
+            / safe_target_operator_norm
+        )
+
+        # ------------------------------------------------------------------
+        # Project the target onto the reachable TE/TM mode span
+        # ------------------------------------------------------------------
+        #
+        # PDL is a power ratio, so the corresponding field-amplitude matrix is
+        #
+        #     D = diag(1, sqrt(PDL)).
+        #
+        pdl = self.resonant_pump_pdl_ratio[idx]
+
+        pdl_amplitude = jnp.stack(
+            [
+                jnp.ones_like(pdl),
+                jnp.sqrt(pdl),
+            ],
+            axis=-1,
+        )
+
+        # A mode with exactly zero field transmission cannot contribute to the
+        # realized operator. For positive PDL, both columns remain present and
+        # this is exactly the span formed by mode_field_orientation.
+        mode_available = pdl_amplitude > 0.0
+
+        reachable_mode_basis = (
+            mode_basis
+            * mode_available[:, None, :].astype(working_dtype)
+        )
+
+        # Least-squares post-PDL TE/TM amplitudes:
+        #
+        #     a = M^+ @ target_direction.
+        #
+        # The pseudoinverse correctly handles nonorthogonal mode vectors and
+        # remains defined if the TE and TM vectors become linearly dependent.
+        #
+        target_mode_amplitudes_after_pdl = jnp.einsum(
+            "nij,nj->ni",
+            jnp.linalg.pinv(reachable_mode_basis),
+            target_direction,
+        )
+
+        # Explicit orthogonal projection:
+        #
+        #     target_projected
+        #         = M @ M^+ @ target_direction.
+        #
+        target_projected = jnp.einsum(
+            "nij,nj->ni",
+            reachable_mode_basis,
+            target_mode_amplitudes_after_pdl,
+        )
+
+        # ------------------------------------------------------------------
+        # Convert post-PDL coefficients into a pre-PDL Jones target
+        # ------------------------------------------------------------------
+        #
+        # _get_resonant_pump_eta_batch later calculates
+        #
+        #     a_after = D @ Jones_before.
+        #
+        # Therefore the waveplates should produce
+        #
+        #     Jones_before proportional to D^+ @ a_after.
+        #
+        safe_pdl_amplitude = jnp.where(
+            mode_available,
+            pdl_amplitude,
+            jnp.ones_like(pdl_amplitude),
+        ).astype(working_dtype)
+
+        target_before_pdl = (
+            target_mode_amplitudes_after_pdl
+            / safe_pdl_amplitude
+        )
+
+        target_before_pdl = jnp.where(
+            mode_available,
+            target_before_pdl,
+            jnp.zeros_like(target_before_pdl),
+        )
+
+        # Normalize the desired pre-PDL Jones state.
+        target_before_pdl_norm = jnp.linalg.norm(
+            target_before_pdl,
+            axis=-1,
+            keepdims=True,
+        )
+
+        target_projected_norm = jnp.linalg.norm(
+            target_projected,
+            axis=-1,
+            keepdims=True,
+        )
+
+        real_dtype = jnp.real(target_before_pdl).dtype
+
+        projection_tolerance = (
+            32.0 * jnp.finfo(real_dtype).eps
+        )
+
+        # If the requested operator has no numerically resolvable component in
+        # the reachable mode span, leave the input polarization unchanged as a
+        # deterministic finite fallback.
+        has_reachable_target = (
+            (target_operator_norm > 0.0)
+            & (target_projected_norm > projection_tolerance)
+            & (target_before_pdl_norm > 0.0)
+            & jnp.isfinite(target_before_pdl_norm)
+        )
+
+        safe_target_before_pdl_norm = jnp.where(
+            has_reachable_target,
+            target_before_pdl_norm,
+            jnp.ones_like(target_before_pdl_norm),
+        )
+
+        target = (
+            target_before_pdl
+            / safe_target_before_pdl_norm
+        )
+
+        target = jnp.where(
+            has_reachable_target,
+            target,
+            source,
+        )
+
+        # ------------------------------------------------------------------
+        # Jones -> Stokes
+        # ------------------------------------------------------------------
+        #
+        #     S1 = |Ex|^2 - |Ey|^2
+        #     S2 = 2 Re(Ex Ey*)
+        #     S3 = 2 Im(Ex Ey*)
+        #
+        def stokes(E):
+            Ex = E[..., 0]
+            Ey = E[..., 1]
+            ExEy = Ex * jnp.conj(Ey)
+
+            return jnp.stack(
+                [
+                    jnp.abs(Ex) ** 2 - jnp.abs(Ey) ** 2,
+                    2.0 * jnp.real(ExEy),
+                    2.0 * jnp.imag(ExEy),
+                ],
+                axis=-1,
+            )
+
+        s_in = stokes(source)
+        s_target = stokes(target)
+
+        S1, S2, S3 = (
+            s_in[..., 0],
+            s_in[..., 1],
+            s_in[..., 2],
+        )
+
+        T1, T2, T3 = (
+            s_target[..., 0],
+            s_target[..., 1],
+            s_target[..., 2],
+        )
+
+        # ------------------------------------------------------------------
+        # QWP1: convert input to linear polarization
+        # ------------------------------------------------------------------
+        #
+        # For a QWP at q,
+        #
+        #     S3_out = sin(2q) S1 - cos(2q) S2.
+        #
+        two_qwp1 = jnp.arctan2(S2, S1)
+        qwp1_angle = 0.5 * two_qwp1
+
+        nx = jnp.cos(two_qwp1)
+        ny = jnp.sin(two_qwp1)
+
+        projection = nx * S1 + ny * S2
+
+        S1_linear = (
+            nx * projection
+            - ny * S3
+        )
+
+        S2_linear = (
+            ny * projection
+            + nx * S3
+        )
+
+        phi_linear_in = jnp.arctan2(
+            S2_linear,
+            S1_linear,
+        )
+
+        # ------------------------------------------------------------------
+        # QWP2: determine which linear state produces the target
+        # ------------------------------------------------------------------
+        #
+        # Propagate the target backwards through QWP2 and choose the QWP angle
+        # that makes the resulting state linear.
+        #
+        two_qwp2 = jnp.arctan2(T2, T1)
+        qwp2_angle = 0.5 * two_qwp2
+
+        nx = jnp.cos(two_qwp2)
+        ny = jnp.sin(two_qwp2)
+
+        projection = nx * T1 + ny * T2
+
+        T1_linear = (
+            nx * projection
+            + ny * T3
+        )
+
+        T2_linear = (
+            ny * projection
+            - nx * T3
+        )
+
+        phi_linear_target = jnp.arctan2(
+            T2_linear,
+            T1_linear,
+        )
+
+        # ------------------------------------------------------------------
+        # HWP: rotate one linear polarization into the other
+        # ------------------------------------------------------------------
+        #
+        # A HWP maps equatorial Stokes angle phi according to
+        #
+        #     phi_out = 4h - phi_in.
+        #
+        hwp_angle = 0.25 * (
+            phi_linear_target
+            + phi_linear_in
+        )
+
+        # ------------------------------------------------------------------
+        # Canonical physical angle ranges
+        # ------------------------------------------------------------------
+        qwp1_angle = jnp.mod(
+            qwp1_angle,
+            jnp.pi,
+        )
+
+        hwp_angle = jnp.mod(
+            hwp_angle,
+            0.5 * jnp.pi,
+        )
+
+        qwp2_angle = jnp.mod(
+            qwp2_angle,
+            jnp.pi,
+        )
+
+        return jnp.stack(
+            [
+                qwp1_angle,
+                hwp_angle,
+                qwp2_angle,
+            ],
+            axis=-1,
+        )
+
+
+    def get_waveplate_angles(self, idx=None):
+        """Calculate QWP-HWP-QWP angles with scalar-index convenience.
+
+        Parameters
+        ----------
+        idx : jax.Array, scalar integer, or None
+            Distribution indices.
+
+        Returns
+        -------
+        jax.Array
+            Scalar idx:
+                shape (3,)
+
+            Array/None:
+                shape (K, 3)
+
+            Final axis is
+
+                [QWP1 angle, HWP angle, QWP2 angle]
+
+            in radians.
+        """
+        idx_array, scalar_idx = self._prepare_indices(idx)
+
+        result = self.get_waveplate_angles_batch(idx_array)
+
+        return result[0] if scalar_idx else result
