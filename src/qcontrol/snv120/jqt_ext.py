@@ -9,6 +9,8 @@ from diffrax import (
     NoProgressMeter,
 )
 from flax import struct
+from jax import config
+config.update("jax_enable_x64", True)
 from jax import Array
 from typing import Any, Callable, Optional, Sequence, Union
 from jax.tree_util import tree_map
@@ -22,7 +24,7 @@ import logging
 from jaxquantum.core.qarray import Qarray, Qtypes, dag_data
 from jaxquantum.core.conversions import jnp2jqt
 from jaxquantum.core.operators import identity_like, multi_mode_basis_set
-from jaxquantum.core.solvers import SolverOptions
+from jaxquantum.core.solvers import SolverOptions, solve
 from jaxquantum.utils.utils import robust_isscalar
 
 def sesolve_components(
@@ -481,11 +483,25 @@ def mesolve_components(
             "hamiltonians and coefficients must have the same length."
         )
 
-    collapse_operators = (
-        ()
-        if collapse_operators is None
-        else tuple(collapse_operators)
-    )
+    # ``get_dynamic_hamiltonian`` returns its collapse operators as one
+    # batched Qarray.  Do not call ``tuple(qarray)`` here: Qarray does not
+    # implement ``__iter__``, so Python falls back to repeatedly calling
+    # ``__getitem__`` until IndexError.  JAX array indexing does not raise
+    # IndexError for an out-of-bounds traced index, which can make tracing
+    # continue indefinitely.  Use the Qarray's static leading batch size to
+    # perform a finite, explicit unstack instead.
+    if collapse_operators is None:
+        collapse_operators = ()
+    elif isinstance(collapse_operators, Qarray):
+        if len(collapse_operators.bdims) == 0:
+            collapse_operators = (collapse_operators,)
+        else:
+            collapse_operators = tuple(
+                collapse_operators[i]
+                for i in range(len(collapse_operators))
+            )
+    else:
+        collapse_operators = tuple(collapse_operators)
 
     filters = (
         (None,) * n_terms

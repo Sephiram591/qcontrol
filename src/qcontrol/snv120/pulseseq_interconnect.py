@@ -667,7 +667,7 @@ def synthesize_analog_pulse(
     corrected_envelope = _analytic_signal_envelope(
         corrected_waveform
     )
-    corrected_envelope /= jnp.max(jnp.abs(corrected_envelope))
+    corrected_envelope /= jnp.max(jnp.abs(corrected_envelope))*amplitude
 
     apply_correction = s21_correct & (w_3db != 0.0)
 

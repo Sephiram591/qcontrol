@@ -49,11 +49,10 @@ from functools import partial
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from jax import config
-
+config.update("jax_enable_x64", True)
 # Configure precision before importing jax.numpy. Calling this after importing
 # jax.numpy can leave arrays created during module initialization at 32-bit
 # precision.
-config.update("jax_enable_x64", True)
 
 import jax
 import jax.numpy as jnp
@@ -90,8 +89,8 @@ __all__ = [
     "solve_hamiltonian",
     "solve_ground_hamiltonian",
     "solve_excited_hamiltonian",
-    "calculate_cyclicity",
-    "calculate_spontaneous_cyclicity",
+    "normalize_transitions",
+    "calculate_folded_branching_ratios",
     "calculate_cyclicity_spinflip",
     "PLE_transitions",
     "PLE_spectrum",
@@ -1586,7 +1585,7 @@ def _solve_ground_and_excited(
 
 
 @jax.jit
-def calculate_cyclicity(transition: Any) -> jax.Array:
+def normalize_transitions(transition: Any) -> jax.Array:
     """Normalize transition rates into excited-state branching ratios.
 
     Parameters
@@ -1594,7 +1593,6 @@ def calculate_cyclicity(transition: Any) -> jax.Array:
     transition : array_like, shape (..., num_excited, num_ground)
         Non-negative transition or spontaneous-emission rates. The final axis
         enumerates destination ground states.
-
     Returns
     -------
     jax.Array
@@ -1727,8 +1725,8 @@ def _validate_included_states(
     return tuple(indices)
 
 
-@partial(jax.jit, static_argnames=("included_states",))
-def calculate_spontaneous_cyclicity(
+@jax.jit
+def calculate_folded_branching_ratios(
     B: Any,
     theta: Any,
     phi: Any,
@@ -1751,7 +1749,6 @@ def calculate_spontaneous_cyclicity(
     L_exc: Any = params.L_exc,
     upsilon_exc: Any = 0.0,
     delta_f_exc: Any = _DEFAULT_DELTA_F_EXC,
-    included_states: Optional[Tuple[int, ...]] = None,
 ) -> jax.Array:
     """Calculate spontaneous-emission branching ratios.
 
@@ -1785,16 +1782,12 @@ def calculate_spontaneous_cyclicity(
         Ground- and excited-manifold iso-orbital couplings.
     delta_f_gnd, delta_f_exc : scalar, optional
         Ground- and excited-manifold asymmetric-Ham corrections.
-    included_states : tuple of int or None, optional
-        Matched ground/excited state indices to retain. The tuple is static
-        under :func:`jax.jit` because it changes the output shape.
 
     Returns
     -------
     cyclicity : jax.Array, shape (num_excited, num_ground)
         Row-normalized polarization-summed spontaneous-emission branching
-        ratios. If ``included_states`` is provided, both axes have length
-        ``len(included_states)`` and the retained submatrix is renormalized.
+        ratios.
 
     Notes
     -----
@@ -1837,23 +1830,177 @@ def calculate_spontaneous_cyclicity(
         upsilon_exc,
         delta_f_exc,
     )
+    return _calculate_folded_branching_ratios(U, U_exc)
 
-    _, spontaneous_rates = _spontaneous_emission_from_eigenvectors(U, U_exc)
+@jax.jit
+def _calculate_folded_branching_ratios(
+    U_gnd: jax.Array,
+    U_exc: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+    """Calculate orbital-relaxation-folded spontaneous-emission branching ratios.
 
-    pair_indices = _validate_included_states(
-        included_states,
-        int(spontaneous_rates.shape[1]),
-        int(spontaneous_rates.shape[0]),
+    This uses the same orbital-relaxation folding model as
+    ``_spinflip_cyclicity_from_eigenvectors``.
+
+    Direct spontaneous emission into the lower ground orbital branch is
+    retained. Emission into the upper ground orbital branch is redistributed
+    into the lower branch according to overlaps of the reduced
+    electron-nuclear spin density matrices,
+
+        relaxation[u, k] = Tr(rho_upper[u] rho_lower[k]).
+
+    The folded emission rates are then normalized along the ground-state axis
+    to give branching ratios.
+
+    Parameters
+    ----------
+    U_gnd : jax.Array, shape (dim, num_ground)
+        Ground-manifold eigenvectors arranged as columns and ordered by energy.
+
+    U_exc : jax.Array, shape (dim, num_excited)
+        Excited-manifold eigenvectors arranged as columns and ordered by energy.
+
+    Returns
+    -------
+    branching_ratios : jax.Array, shape (num_excited, num_ground)
+        Row-normalized folded spontaneous-emission branching ratios.
+
+        The first half of the ground-state columns contain the folded
+        branching ratios. The upper-half columns are zero because population
+        emitted into the upper orbital branch is assumed to relax immediately
+        into the lower orbital branch.
+
+        Rows with zero total emission are returned as zeros.
+
+    Notes
+    -----
+    The ground eigenstates are assumed to be energy ordered such that the first
+    half form the lower orbital branch and the second half form the upper
+    orbital branch.
+
+    Unlike ``_spinflip_cyclicity_from_eigenvectors``, this function returns
+    ordinary branching probabilities rather than a photons-before-pump-out
+    cyclicity metric.
+    """
+    num_ground = int(U_gnd.shape[1])
+    orbital_dim = int(round(2.0 * float(params.S) + 1.0))
+    electron_dim = orbital_dim
+    nuclear_dim = int(round(2.0 * float(params.Sn) + 1.0))
+
+    if num_ground % 2 != 0:
+        raise ValueError(
+            "Orbital folding requires an even number of ground states."
+        )
+
+    num_lower = num_ground // 2
+
+    # Direct polarization-summed spontaneous-emission strengths:
+    #
+    #     emission[e, g]
+    #         = sum_j |<exc_e | p_j | gnd_g>|^2
+    #
+    # Shape:
+    #     (num_excited, num_ground)
+    matrix_elements, emission = _spontaneous_emission_from_eigenvectors(
+        U_gnd,
+        U_exc,
     )
-    if pair_indices is not None:
-        indices = jnp.asarray(pair_indices, dtype=jnp.int32)
-        spontaneous_rates = spontaneous_rates[
-            indices[:, None],
-            indices[None, :],
-        ]
 
-    return calculate_cyclicity(spontaneous_rates)
+    # Trace out the orbital subsystem while retaining the complete
+    # electron-nuclear spin density matrix for every ground eigenstate.
+    #
+    # Shape:
+    #     (num_ground, spin_dim, spin_dim)
+    rho_spin = _reduced_spin_density_matrices(
+        U_gnd,
+        orbital_dim=orbital_dim,
+        electron_dim=electron_dim,
+        nuclear_dim=nuclear_dim,
+    )
 
+    rho_lower = rho_spin[:num_lower, :, :]
+    rho_upper = rho_spin[num_lower:, :, :]
+
+    # Probability weight for orbital relaxation
+    #
+    #     upper state u -> lower state k
+    #
+    # based on the overlap of their reduced electron-nuclear spin states:
+    #
+    #     relaxation[u, k]
+    #         = Tr(rho_upper[u] rho_lower[k]).
+    #
+    # Shape:
+    #     (num_lower, num_lower)
+    relaxation = jnp.real(
+        jnp.einsum(
+            "ust,kts->uk",
+            rho_upper,
+            rho_lower,
+        )
+    )
+
+    # Numerical roundoff can produce very small negative values.
+    relaxation = jnp.maximum(
+        relaxation,
+        0.0,
+    )
+
+    # Normalize every upper-state relaxation row so that all population in an
+    # upper orbital state eventually reaches the lower orbital manifold.
+    row_total = jnp.sum(
+        relaxation,
+        axis=-1,
+        keepdims=True,
+    )
+
+    # Safe fallback for a state whose reduced-density overlaps all vanish.
+    uniform = jnp.full_like(
+        relaxation,
+        1.0 / num_lower,
+    )
+
+    relaxation = jnp.where(
+        row_total > 0.0,
+        relaxation
+        / jnp.where(
+            row_total > 0.0,
+            row_total,
+            1.0,
+        ),
+        uniform,
+    )
+
+    # Fold emission into the upper orbital branch back into the lower branch:
+    #
+    #     Gamma_folded[e, k]
+    #         = Gamma[e, k]
+    #         + sum_u Gamma[e, upper_u] * relaxation[u, k].
+    #
+    # Shape:
+    #     (num_excited, num_lower)
+    emission_folded = (
+        emission[:, :num_lower]
+        + jnp.einsum(
+            "eu,uk->ek",
+            emission[:, num_lower:],
+            relaxation,
+        )
+    )
+
+    # Preserve the original ground-state axis layout. The upper orbital
+    # columns become zero because that population has been folded into the
+    # lower branch.
+    folded_rates = jnp.zeros_like(emission)
+
+    folded_rates = folded_rates.at[
+        :, :num_lower
+    ].set(
+        emission_folded
+    )
+
+    # Convert folded rates into row-normalized branching probabilities.
+    return matrix_elements, normalize_transitions(folded_rates)
 
 def _spinflip_cyclicity_from_eigenvectors(
     U_gnd: jax.Array,
@@ -2233,7 +2380,7 @@ def PLE_transitions(
     transition : jax.Array, shape (num_excited, num_ground)
         Coherent polarization-projected excitation strengths
         ``|sum_j eta_j <exc_l|p_j|gnd_k>|**2``.
-    cyclicity : jax.Array, shape (num_excited, num_ground)
+    branching_ratios : jax.Array, shape (num_excited, num_ground)
         Polarization-summed spontaneous-emission branching ratios.
 
     Notes
@@ -2277,7 +2424,7 @@ def PLE_transitions(
         delta_f_exc,
     )
 
-    matrix_elements, emission = _spontaneous_emission_from_eigenvectors(
+    matrix_elements, branching_ratios = _calculate_folded_branching_ratios(
         U,
         U_exc,
     )
@@ -2293,7 +2440,6 @@ def PLE_transitions(
     )
     amplitude = jnp.einsum("j,jlk->lk", eta, matrix_elements)
     transition = jnp.abs(amplitude) ** 2
-    cyclicity = calculate_cyclicity(emission)
 
     return (
         E,
@@ -2305,7 +2451,7 @@ def PLE_transitions(
         U_exc,
         alignment_exc,
         transition,
-        cyclicity,
+        branching_ratios,
     )
 
 
@@ -2814,9 +2960,9 @@ def _project_operator_data(
 def _block_data(
     ground_data: jax.Array,
     excited_data: jax.Array,
-    excited_shift: Any,
+    subtract_excited_mean: bool,
     subtract_ground_mean: bool,
-) -> jax.Array:
+) -> Tuple[jax.Array, jax.Array]:
     """Build a two-manifold block-diagonal dense matrix.
 
     Parameters
@@ -2825,46 +2971,53 @@ def _block_data(
         Ground-manifold operator.
     excited_data : jax.Array, shape (num_excited, num_excited)
         Excited-manifold operator.
-    excited_shift : scalar
-        Scalar identity shift added to the excited block.
+    subtract_excited_mean : bool
+        If ``True``, subtract the mean diagonal excited energy from the excited block.
     subtract_ground_mean : bool
         If ``True``, subtract the mean diagonal ground energy from both blocks.
 
     Returns
     -------
     jax.Array, shape (num_ground + num_excited, num_ground + num_excited)
-        Matrix ``diag(ground_data, excited_data + excited_shift)`` after the
+        Matrix ``diag(ground_data, excited_data)`` after the
         optional common energy subtraction.
+    jax.Array
+        Offset for the excited-ground split in the reduced model.
     """
     ground_dim = int(ground_data.shape[0])
     excited_dim = int(excited_data.shape[0])
-    dtype = jnp.result_type(ground_data, excited_data, excited_shift)
+    dtype = jnp.result_type(ground_data, excited_data)
 
     ground_data = ground_data.astype(dtype)
     excited_data = excited_data.astype(dtype)
     eye_ground = jnp.eye(ground_dim, dtype=dtype)
     eye_excited = jnp.eye(excited_dim, dtype=dtype)
 
-    excited_data = excited_data + excited_shift * eye_excited
+    optical_transition_offset = jnp.array(0.0)
+    if subtract_excited_mean:
+        average_excited_energy = jnp.mean(jnp.diag(excited_data))
+        excited_data = excited_data - average_excited_energy * eye_excited
+        optical_transition_offset += average_excited_energy
+
     if subtract_ground_mean:
         average_ground_energy = jnp.mean(jnp.diag(ground_data))
         ground_data = ground_data - average_ground_energy * eye_ground
-        excited_data = excited_data - average_ground_energy * eye_excited
+        optical_transition_offset -= average_ground_energy
 
     zero_ge = jnp.zeros((ground_dim, excited_dim), dtype=dtype)
     zero_eg = jnp.zeros((excited_dim, ground_dim), dtype=dtype)
     top = jnp.concatenate([ground_data, zero_ge], axis=1)
     bottom = jnp.concatenate([zero_eg, excited_data], axis=1)
-    return jnp.concatenate([top, bottom], axis=0)
+    return jnp.concatenate([top, bottom], axis=0), optical_transition_offset
 
 
 def _three_block_data(
     ground_data: jax.Array,
     excited_data: jax.Array,
     dark_energy: Any,
-    excited_shift: Any,
+    subtract_excited_mean: bool,
     subtract_ground_mean: bool,
-) -> jax.Array:
+) -> Tuple[jax.Array, jax.Array]:
     """Build ground, excited, and dark-state diagonal blocks.
 
     Parameters
@@ -2875,21 +3028,22 @@ def _three_block_data(
         Excited-manifold operator.
     dark_energy : scalar
         Energy assigned to the appended one-dimensional dark state.
-    excited_shift : scalar
-        Scalar identity shift added to the excited block.
+    subtract_excited_mean : bool
+        If ``True``, subtract the mean diagonal excited energy from the excited block.
     subtract_ground_mean : bool
-        Subtract the mean ground diagonal energy from the ground and excited
-        blocks before appending the dark state.
+        If ``True``, subtract the mean diagonal ground energy from the ground block before appending the dark state.
 
     Returns
     -------
     jax.Array
         Dense matrix ``diag(H_ground, H_excited + shift, dark_energy)``.
+    jax.Array
+        Offset for the excited-ground split in the reduced model.
     """
-    two_block = _block_data(
+    two_block, optical_transition_offset = _block_data(
         ground_data,
         excited_data,
-        excited_shift,
+        subtract_excited_mean,
         subtract_ground_mean,
     )
     dtype = jnp.result_type(two_block, dark_energy)
@@ -2898,7 +3052,7 @@ def _three_block_data(
     result = jnp.zeros((total_dim, total_dim), dtype=dtype)
     result = result.at[:-1, :-1].set(two_block)
     result = result.at[-1, -1].set(jnp.asarray(dark_energy, dtype=dtype))
-    return result
+    return result, optical_transition_offset
 
 
 def _offdiagonal_data(
@@ -2941,7 +3095,6 @@ def get_dynamic_hamiltonian(
     B: Any,
     theta: Any,
     phi: Any,
-    excited_ground_split: Any,
     excited_state_lifetime: Any,
     pump_eta_x: Any,
     pump_eta_y: Any,
@@ -2970,7 +3123,7 @@ def get_dynamic_hamiltonian(
     delta_f_exc: Any = _DEFAULT_DELTA_F_EXC,
     included_states: Optional[Tuple[int, ...]] = None,
     dark_state: Any = 0.0,
-) -> Tuple[jqt.Qarray, jqt.Qarray, List[jqt.Qarray], jqt.Qarray]:
+) -> Tuple[jqt.Qarray, jqt.Qarray, List[jqt.Qarray], jqt.Qarray, jax.Array]:
     """Build static, microwave, optical, and spontaneous-decay operators.
 
     Parameters
@@ -2979,8 +3132,6 @@ def get_dynamic_hamiltonian(
         Static magnetic-field magnitude in Hamiltonian units.
     theta, phi : scalar
         Polar and azimuthal static-field angles in radians.
-    excited_ground_split : scalar
-        Common energy offset added to the excited manifold.
     excited_state_lifetime : scalar
         Excited-state lifetime. The total decay rate is its reciprocal.
     pump_eta_x, pump_eta_y, pump_eta_z : scalar
@@ -3030,7 +3181,10 @@ def get_dynamic_hamiltonian(
         Two fixed optical operators: excited-to-ground and ground-to-excited
         blocks, respectively.
     c_ops : jaxquantum.Qarray
-        Batched spontaneous-emission collapse operators.
+        Batched spontaneous-emission collapse operators. 
+    optical_transition_offset : jax.Array
+        Scalar offset removed from the excited-ground transition frequencies
+        when independently centering the retained ground and excited manifolds.
 
     Notes
     -----
@@ -3101,7 +3255,7 @@ def get_dynamic_hamiltonian(
         + pump_eta_y * _DIPOLES[1]
         + pump_eta_z * _DIPOLES[2]
     )
-    p_eta_data = _dense_data(p_eta)
+    p_eta_data = _dense_data(p_eta)/2
     p_eta_dag_data = jnp.conj(p_eta_data.T)
 
     # Collapse operators are defined in the static eigenbases so that each
@@ -3111,11 +3265,7 @@ def get_dynamic_hamiltonian(
     gnd_states = _state_matrix(U_gnd_states)
     exc_states = _state_matrix(U_exc_states)
 
-    _, spontaneous_rates = _spontaneous_emission_from_eigenvectors(
-        _eigenvector_columns(U_gnd_states),
-        _eigenvector_columns(U_exc_states),
-    )
-    cyclicity = calculate_cyclicity(spontaneous_rates)
+    _, branching_ratios = _calculate_folded_branching_ratios(_eigenvector_columns(U_gnd_states), _eigenvector_columns(U_exc_states))
 
     num_ground_states = int(gnd_states.shape[0])
     num_excited_states = int(exc_states.shape[0])
@@ -3135,16 +3285,16 @@ def get_dynamic_hamiltonian(
     if pair_indices is None:
         # Full direct-product representation. The leading dimension of size two
         # labels the ground and excited electronic manifolds.
-        H0_data = _block_data(
+        H0_data, optical_transition_offset = _block_data(
             _dense_data(H_gnd_static),
             _dense_data(H_exc_static),
-            excited_ground_split,
+            False,
             False,
         )
-        HB_data = _block_data(
+        HB_data, _ = _block_data(
             _dense_data(H_gnd_drive),
             _dense_data(H_exc_drive),
-            0.0,
+            False,
             False,
         )
         H0 = jqt.Qarray.create(H0_data, dims=expanded_dims)
@@ -3177,7 +3327,7 @@ def get_dynamic_hamiltonian(
                 )
                 jump_rate = (
                     total_decay_rate
-                    * cyclicity[excited_index, ground_index]
+                    * branching_ratios[excited_index, ground_index]
                 )
                 jump_ge = jnp.sqrt(jump_rate) * jump_base
                 c_ops_list.append(
@@ -3207,16 +3357,13 @@ def get_dynamic_hamiltonian(
             kept_exc_states,
             kept_exc_states,
         )
-        H0 = jqt.Qarray.create(
-            _three_block_data(
+        H0_data, optical_transition_offset = _three_block_data(
                 H_gnd_static_reduced,
                 H_exc_static_reduced,
                 dark_state,
-                excited_ground_split,
                 True,
-            ),
-            dims=reduced_dims,
-        )
+                True,
+            )
 
         H_gnd_drive_reduced = _project_operator_data(
             _dense_data(H_gnd_drive),
@@ -3228,16 +3375,15 @@ def get_dynamic_hamiltonian(
             kept_exc_states,
             kept_exc_states,
         )
-        HB = jqt.Qarray.create(
-            _three_block_data(
+        HB_data, _ = _three_block_data(
                 H_gnd_drive_reduced,
                 H_exc_drive_reduced,
                 0.0,
-                0.0,
                 False,
-            ),
-            dims=reduced_dims,
-        )
+                False,
+            )
+        H0 = jqt.Qarray.create(H0_data, dims=reduced_dims)
+        HB = jqt.Qarray.create(HB_data, dims=reduced_dims)
 
         # Project p.eta between the retained ground and excited eigenstates,
         # then append a zero row and column for the dark state.
@@ -3272,7 +3418,7 @@ def get_dynamic_hamiltonian(
         c_ops_list = []
         zero_reduced_full = jnp.zeros(
             (total_reduced_dim, total_reduced_dim),
-            dtype=cyclicity.dtype,
+            dtype=branching_ratios.dtype,
         )
 
         # This mapping is static Python data because ``included_states`` is a
@@ -3291,7 +3437,7 @@ def get_dynamic_hamiltonian(
                 )
                 jump_rate = (
                     total_decay_rate
-                    * cyclicity[excited_full, ground_full]
+                    * branching_ratios[excited_full, ground_full]
                 )
                 jump_operator = zero_reduced_full.at[
                     target_index,
@@ -3302,7 +3448,7 @@ def get_dynamic_hamiltonian(
                 )
 
     c_ops = jqt.Qarray.from_list(c_ops_list)
-    return H0, HB, Hs_optical, c_ops
+    return H0, HB, Hs_optical, c_ops, optical_transition_offset
 
 
 def _project_single_manifold(

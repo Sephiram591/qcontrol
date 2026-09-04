@@ -31,7 +31,8 @@ individual lattice sites. In ideal D3d symmetry:
 import math
 from enum import IntEnum
 from typing import Dict, NamedTuple, Tuple
-
+from jax import config
+config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 
