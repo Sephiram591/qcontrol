@@ -215,7 +215,7 @@ class SnVControlState(NamedTuple):
     Control state for the SnV120 qubit.
     """
     magnet_settings: jnp.ndarray # (3,) physical magnet settings in tesla
-    waveplate_angles: jnp.ndarray # (2,) waveplate angles in radians
+    waveplate_angles: jnp.ndarray # (3,) [QWP1, HWP, QWP2] angles in radians
 
 class SnV120Distribution(NamedTuple):
     """
@@ -301,30 +301,43 @@ class SnV120Distribution(NamedTuple):
 
         return idx_array, scalar_idx
 
-    def _prepare_experiment_index(self, experiment_idx):
-        """Normalize the distribution member used to choose control settings.
+    def _prepare_control_state(
+        self,
+        control_state: SnVControlState | None,
+    ) -> SnVControlState | None:
+        """Validate and normalize a shared physical control state.
 
-        ``experiment_idx`` identifies one distribution member whose optimal
-        vector-magnet and waveplate settings are applied while evaluating every
-        member selected by ``idx``.  It is intentionally restricted to one
-        scalar index: an array of experiment indices would require an additional
-        experiment batch axis rather than the shared-settings behavior used by
-        the Hamiltonian methods.
+        A supplied control state is shared by every distribution member selected
+        by ``idx``.  ``None`` retains the per-member-optimal behavior: each
+        selected member uses its own magnet settings and waveplate angles.
         """
-        if experiment_idx is None:
+        if control_state is None:
             return None
 
-        experiment_idx = jnp.atleast_1d(
-            jnp.asarray(experiment_idx, dtype=jnp.int32)
-        )
-
-        if experiment_idx.ndim != 1 or experiment_idx.shape[0] != 1:
-            raise ValueError(
-                "`experiment_idx` must be a scalar integer or a length-one "
-                "integer array."
+        if not isinstance(control_state, SnVControlState):
+            raise TypeError(
+                "`control_state` must be an SnVControlState or None."
             )
 
-        return experiment_idx
+        magnet_settings = jnp.asarray(control_state.magnet_settings)
+        waveplate_angles = jnp.asarray(control_state.waveplate_angles)
+
+        if magnet_settings.ndim != 1 or magnet_settings.shape[0] != 3:
+            raise ValueError(
+                "`control_state.magnet_settings` must have shape (3,)."
+            )
+
+        # The optical model uses a QWP-HWP-QWP sequence, hence three angles.
+        if waveplate_angles.ndim != 1 or waveplate_angles.shape[0] != 3:
+            raise ValueError(
+                "`control_state.waveplate_angles` must have shape (3,) "
+                "for [QWP1, HWP, QWP2]."
+            )
+
+        return SnVControlState(
+            magnet_settings=magnet_settings,
+            waveplate_angles=waveplate_angles,
+        )
 
     def _select_scalar_parameter_batch(self, value, idx):
         """Select a shared scalar or particle-resolved scalar parameter.
@@ -809,7 +822,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx,
         frame="lab",
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Return realized magnetic-field vectors in tesla.
 
@@ -819,10 +832,10 @@ class SnV120Distribution(NamedTuple):
             Distribution indices.
         frame : {"lab", "crystal", "dipole"}, optional
             Output coordinate frame; static under JIT.
-        experiment_idx : int or length-one jax.Array or None, optional
-            Distribution member used to calculate the shared vector-magnet
-            settings. If ``None``, each member in ``idx`` uses its own optimal
-            settings, preserving the original behavior.
+        control_state : SnVControlState or None, optional
+            Explicit physical controls shared by every selected member. This
+            method uses ``control_state.magnet_settings``. If ``None``, each
+            member in ``idx`` uses its own optimal magnet settings.
 
         Returns
         -------
@@ -833,17 +846,15 @@ class SnV120Distribution(NamedTuple):
         if idx.ndim != 1:
             raise ValueError("`idx` must be a one-dimensional integer array.")
 
-        experiment_idx = self._prepare_experiment_index(experiment_idx)
+        control_state = self._prepare_control_state(control_state)
 
-        if experiment_idx is None:
+        if control_state is None:
+            # Preserve the original per-member-optimal behavior.
             B_settings = self.get_B_settings_batch(idx)
         else:
-            # Calculate the physical vector-magnet controls once for the
-            # experiment member, then apply those same controls to every model
-            # member selected by idx.
-            shared_B_settings = self.get_B_settings_batch(
-                experiment_idx
-            )[0]
+            # Apply one explicit physical vector-magnet setting to every model
+            # member. Each member still supplies its own magnet calibration.
+            shared_B_settings = control_state.magnet_settings
             B_settings = jnp.broadcast_to(
                 shared_B_settings,
                 (idx.shape[0], shared_B_settings.shape[0]),
@@ -873,13 +884,13 @@ class SnV120Distribution(NamedTuple):
         self,
         idx,
         frame="dipole",
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Return field magnitude in GHz and direction angles for an index batch."""
         B_T = self.get_B_cartesian_batch(
             idx,
             frame=frame,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         theta, phi = cartesian_to_angles(B_T)
         magnitude_GHz = jnp.linalg.norm(B_T, axis=-1) * (
@@ -908,7 +919,11 @@ class SnV120Distribution(NamedTuple):
         _, _, phi = self.get_B_spherical_batch(idx_array, frame=frame)
         return phi[0] if scalar_idx else phi
 
-    def get_resonant_pump_eta(self, idx=None, experiment_idx=None):
+    def get_resonant_pump_eta(
+        self,
+        idx=None,
+        control_state: SnVControlState | None = None,
+    ):
         """Return complex dipole-frame resonant pump couplings in GHz.
 
         Parameters
@@ -917,11 +932,12 @@ class SnV120Distribution(NamedTuple):
             Distribution indices. If None, return results for all members.
             A scalar index returns shape ``(3,)``. A one-dimensional index 
             array returns shape ``(K, 3)``.
-        experiment_idx : int or length-one array_like or None, optional
-            Distribution member used to choose the shared QWP-HWP-QWP angles.
-            The selected angles are then propagated through each ``idx``
-            member's own source polarization, PDL, mode directions, and
-            coupling rate.
+        control_state : SnVControlState or None, optional
+            Explicit physical controls shared by every selected member. This
+            method uses ``control_state.waveplate_angles`` and propagates those
+            angles through each member's own source polarization, PDL, mode
+            directions, and coupling rate. If ``None``, each member uses its
+            own optimal QWP-HWP-QWP angles.
 
         Returns
         -------
@@ -931,24 +947,29 @@ class SnV120Distribution(NamedTuple):
         idx_array, scalar_idx = self._prepare_indices(idx)
         result = self._get_resonant_pump_eta_batch(
             idx_array,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         return result[0] if scalar_idx else result
 
     @jax.jit
-    def _get_resonant_pump_eta_batch(self, idx, experiment_idx=None):
+    def _get_resonant_pump_eta_batch(
+        self,
+        idx,
+        control_state: SnVControlState | None = None,
+    ):
         """Return complex dipole-frame pump couplings, shape (N, 3), in GHz.
 
-        If ``experiment_idx`` is supplied, its optimal waveplate angles are
-        shared across the full ``idx`` batch. All optical-device parameters
+        If ``control_state`` is supplied, its explicit QWP-HWP-QWP angles
+        are shared across the full ``idx`` batch. All optical-device parameters
         remain resolved by ``idx`` so that each model member predicts the
-        realized coupling under those common physical settings.
+        realized coupling under those common physical settings. If it is
+        ``None``, each member uses its own optimal waveplate angles.
         """
         idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
         if idx.ndim != 1:
             raise ValueError("`idx` must be a one-dimensional integer array.")
 
-        experiment_idx = self._prepare_experiment_index(experiment_idx)
+        control_state = self._prepare_control_state(control_state)
 
         # Initial Jones vector in the TE/TM basis:
         #
@@ -964,12 +985,11 @@ class SnV120Distribution(NamedTuple):
         )
 
         # QWP-HWP-QWP settings that produce the required pre-PDL state.
-        if experiment_idx is None:
+        if control_state is None:
+            # Preserve the original per-member-optimal behavior.
             waveplate_angles = self.get_waveplate_angles_batch(idx)
         else:
-            shared_waveplate_angles = self.get_waveplate_angles_batch(
-                experiment_idx
-            )[0]
+            shared_waveplate_angles = control_state.waveplate_angles
             waveplate_angles = jnp.broadcast_to(
                 shared_waveplate_angles,
                 (idx.shape[0], shared_waveplate_angles.shape[0]),
@@ -1108,7 +1128,6 @@ class SnV120Distribution(NamedTuple):
 
     @jax.jit(
         static_argnames=(
-            "experiment_idx",
             "max_bessel_order",
             "bessel_series_terms",
         )
@@ -1117,7 +1136,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx,
         eom_frequency=0.0,
-        experiment_idx:int|None =None,
+        control_state: SnVControlState | None = None,
         max_bessel_order: int = 2,
         bessel_series_terms: int = 48,
     ):
@@ -1137,6 +1156,10 @@ class SnV120Distribution(NamedTuple):
         Sideband n therefore has squared coupling
 
             Omega_n,t^2 = J_n(beta)^2 * Omega_t^2.
+
+        A supplied ``control_state`` applies one explicit vector-magnet setting
+        and one explicit QWP-HWP-QWP setting to the entire ``idx`` batch. If it
+        is ``None``, each member uses its own optimal controls.
 
         Returns
         -------
@@ -1183,12 +1206,15 @@ class SnV120Distribution(NamedTuple):
         #   - TE/TM mode directions.
         #
         # Shape: (N, 3).
-        pump_eta = self._get_resonant_pump_eta_batch(idx, experiment_idx=experiment_idx)
+        pump_eta = self._get_resonant_pump_eta_batch(
+            idx,
+            control_state=control_state,
+        )
 
         # Static Hamiltonian inputs.
         B, theta, phi = self.get_B_spherical_batch(
             idx,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
             frame="dipole",
         )
         neighbor_idx = self.hyperfine_neighbor_idx[idx]
@@ -1425,7 +1451,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx=None,
         eom_frequency=0.0,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
         max_bessel_order: int = 2,
         bessel_series_terms: int = 48,
     ):
@@ -1450,6 +1476,11 @@ class SnV120Distribution(NamedTuple):
 
             A scalar input is represented internally as a length-one frequency
             sweep.
+
+        control_state : SnVControlState or None, optional
+            Explicit vector-magnet and QWP-HWP-QWP controls shared by every
+            selected member. If ``None``, each member uses its own optimal
+            controls.
 
         max_bessel_order : int, optional
             Largest positive and negative EOM sideband order to include.
@@ -1497,7 +1528,7 @@ class SnV120Distribution(NamedTuple):
         rates, branching_ratios = self.scattering_rate_batch(
             idx=idx,
             eom_frequency=eom_frequency,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
             max_bessel_order=max_bessel_order,
             bessel_series_terms=bessel_series_terms,
         )
@@ -1511,13 +1542,19 @@ class SnV120Distribution(NamedTuple):
         return rates, branching_ratios
         
     @jax.jit(static_argnames=("ground_state",))
-    def solve_hamiltonian_batch(self, idx, ground_state=True, experiment_idx=None):
+    def solve_hamiltonian_batch(
+        self,
+        idx,
+        ground_state=True,
+        control_state: SnVControlState | None = None,
+    ):
         """Solve the static Hamiltonian for a one-dimensional particle batch.
 
         ``ground_state`` is static because it selects different constants and
-        parameter arrays. ``experiment_idx`` selects one member's optimal
-        vector-magnet settings; those physical settings are then applied to all
-        members in ``idx`` using each member's own magnet calibration.
+        parameter arrays. A supplied ``control_state`` provides one explicit
+        vector-magnet setting that is applied to every member in ``idx`` using
+        each member's own magnet calibration. If it is ``None``, every member
+        uses its own optimal magnet settings.
 
         The backend evaluates one parameter point at a time.  This method maps
         that scalar backend over the selected distribution members and supplies
@@ -1554,7 +1591,7 @@ class SnV120Distribution(NamedTuple):
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         return jax.vmap(
@@ -1584,7 +1621,12 @@ class SnV120Distribution(NamedTuple):
             delta_f,
         )
 
-    def solve_hamiltonian(self, idx=None, ground_state=True, experiment_idx=None):
+    def solve_hamiltonian(
+        self,
+        idx=None,
+        ground_state=True,
+        control_state: SnVControlState | None = None,
+    ):
         scalar = idx is not None and jnp.asarray(idx).ndim == 0
 
         if idx is None:
@@ -1592,7 +1634,11 @@ class SnV120Distribution(NamedTuple):
         else:
             idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
 
-        result = self.solve_hamiltonian_batch(idx, ground_state, experiment_idx)
+        result = self.solve_hamiltonian_batch(
+            idx,
+            ground_state=ground_state,
+            control_state=control_state,
+        )
 
         if scalar:
             return jax.tree_util.tree_map(lambda x: x[0], result)
@@ -1600,7 +1646,11 @@ class SnV120Distribution(NamedTuple):
         return result
 
     @jax.jit
-    def get_folded_branching_ratios_batch(self, idx, experiment_idx=None):
+    def get_folded_branching_ratios_batch(
+        self,
+        idx,
+        control_state: SnVControlState | None = None,
+    ):
         """Calculate spontaneous-emission branching ratios for a batch."""
         def calculate_one(
             B,
@@ -1652,7 +1702,7 @@ class SnV120Distribution(NamedTuple):
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         return jax.vmap(calculate_one)(
             B,
@@ -1673,7 +1723,11 @@ class SnV120Distribution(NamedTuple):
             delta_f_exc,
         )
 
-    def get_folded_branching_ratios(self, idx=None, experiment_idx=None):
+    def get_folded_branching_ratios(
+        self,
+        idx=None,
+        control_state: SnVControlState | None = None,
+    ):
         scalar = idx is not None and jnp.asarray(idx).ndim == 0
 
         if idx is None:
@@ -1681,14 +1735,21 @@ class SnV120Distribution(NamedTuple):
         else:
             idx = jnp.atleast_1d(jnp.asarray(idx, dtype=jnp.int32))
 
-        result = self.get_folded_branching_ratios_batch(idx, experiment_idx)
+        result = self.get_folded_branching_ratios_batch(
+            idx,
+            control_state=control_state,
+        )
 
         if scalar:
             return jax.tree_util.tree_map(lambda x: x[0], result)
 
         return result
     
-    def get_ple_freqs(self, idx=None, experiment_idx=None):
+    def get_ple_freqs(
+        self,
+        idx=None,
+        control_state: SnVControlState | None = None,
+    ):
         """Return the four matched lower-orbital PLE transition frequencies.
 
         The returned transitions are
@@ -1710,10 +1771,10 @@ class SnV120Distribution(NamedTuple):
             - One-dimensional index array: returns shape ``(K, 4)``.
             - ``None``: evaluates all members and returns shape ``(N, 4)``.
 
-        experiment_idx : int, length-one array_like, or None, optional
-            Distribution member whose vector-magnet settings are applied to all
-            members selected by ``idx``. If ``None``, each member uses its own
-            optimized magnet settings.
+        control_state : SnVControlState or None, optional
+            Explicit physical controls shared by every selected member. This
+            calculation uses ``control_state.magnet_settings``. If ``None``,
+            each member uses its own optimal magnet settings.
 
         Returns
         -------
@@ -1738,7 +1799,7 @@ class SnV120Distribution(NamedTuple):
         ) = self.solve_hamiltonian_batch(
             idx=idx_array,
             ground_state=True,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         (
@@ -1750,7 +1811,7 @@ class SnV120Distribution(NamedTuple):
         ) = self.solve_hamiltonian_batch(
             idx=idx_array,
             ground_state=False,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         # E_gnd and E_exc have shape (K, num_states).
@@ -1772,14 +1833,18 @@ class SnV120Distribution(NamedTuple):
         # Preserve the class's scalar-index convenience convention.
         return ple_freqs_GHz[0] if scalar_idx else ple_freqs_GHz
     
-    def get_emr_freqs(self, idx=None, experiment_idx=None):
+    def get_emr_freqs(
+        self,
+        idx=None,
+        control_state: SnVControlState | None = None,
+    ):
         """
         Returns the electron magnetic resonance frequencies.
         """
         E, Eref, U, U_states, alignment = self.solve_hamiltonian(
             idx=idx,
             ground_state=True,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         return jnp.stack(
             [
@@ -1789,14 +1854,18 @@ class SnV120Distribution(NamedTuple):
             axis=-1,
         )
 
-    def get_nmr_freqs(self, idx=None, experiment_idx=None):
+    def get_nmr_freqs(
+        self,
+        idx=None,
+        control_state: SnVControlState | None = None,
+    ):
         """
         Returns the nuclear magnetic resonance frequencies.
         """
         E, Eref, U, U_states, alignment = self.solve_hamiltonian(
             idx=idx,
             ground_state=True,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         return jnp.stack(
             [
@@ -1829,7 +1898,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx,
         included_states=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Construct dynamic Hamiltonians for a one-dimensional index batch.
 
@@ -1838,10 +1907,11 @@ class SnV120Distribution(NamedTuple):
         scattering-rate model use exactly the same QWP-HWP-QWP, PDL, TE/TM
         mode-direction, and coupling-rate handling.
 
-        If ``experiment_idx`` is supplied, its optimal vector-magnet settings
+        If ``control_state`` is supplied, its explicit vector-magnet settings
         and QWP-HWP-QWP angles are used for every selected distribution member.
         Each member in ``idx`` still contributes its own physical calibration
-        and Hamiltonian parameters.
+        and Hamiltonian parameters. If it is ``None``, each member uses its own
+        optimal controls.
         """
 
         def calculate_one(
@@ -1900,11 +1970,11 @@ class SnV120Distribution(NamedTuple):
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         pump_eta = self._get_resonant_pump_eta_batch(
             idx,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         neighbor_idx = self.hyperfine_neighbor_idx[idx]
@@ -1944,7 +2014,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx=None,
         included_states=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         scalar = idx is not None and jnp.asarray(idx).ndim == 0
 
@@ -1956,7 +2026,7 @@ class SnV120Distribution(NamedTuple):
         result = self.get_excitation_hamiltonian_batch(
             idx,
             included_states=included_states,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         if scalar:
@@ -1971,7 +2041,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx,
         included_states=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Construct ground-state Hamiltonians for an index batch.
 
@@ -1980,9 +2050,10 @@ class SnV120Distribution(NamedTuple):
         frontend retains its two-angle microwave orientation while this adapter
         passes separate scalar angles to the backend.
 
-        If ``experiment_idx`` is supplied, its optimal vector-magnet settings
+        If ``control_state`` is supplied, its explicit vector-magnet settings
         are applied to every selected distribution member using that member's
-        own magnet calibration.
+        own magnet calibration. If it is ``None``, each member uses its own
+        optimal magnet settings.
         """
         def calculate_one(
             B,
@@ -2019,7 +2090,7 @@ class SnV120Distribution(NamedTuple):
         B, theta, phi = self.get_B_spherical_batch(
             idx,
             frame="dipole",
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
         delta_f_gnd = self._select_scalar_parameter_batch(
             params.delta_f_gnd,
@@ -2045,7 +2116,7 @@ class SnV120Distribution(NamedTuple):
         self,
         idx=None,
         included_states=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         scalar = idx is not None and jnp.asarray(idx).ndim == 0
 
@@ -2057,7 +2128,7 @@ class SnV120Distribution(NamedTuple):
         result = self.get_ground_hamiltonian_batch(
             idx,
             included_states=included_states,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         if scalar:
@@ -2075,7 +2146,7 @@ class SnV120Distribution(NamedTuple):
         included_states,
         saveat_final_only=False,
         solver_options_args=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Run Hamiltonian evolutions for a batch of distribution indices.
 
@@ -2088,8 +2159,9 @@ class SnV120Distribution(NamedTuple):
             tau: Fixed-shape time array in seconds.
             psi0: Initial quantum state shared by all distribution members.
             included_states: Static tuple identifying the included eigenstates.
-            experiment_idx: Distribution member whose optimal vector-magnet
-                settings are applied to every member in ``idx``.
+            control_state: Explicit physical controls shared by every member
+                in ``idx``. Only ``magnet_settings`` is used here. If ``None``,
+                each member uses its own optimal magnet settings.
 
         Returns:
             A tuple ``(states, filter_states, populations)`` where every array leaf
@@ -2150,7 +2222,7 @@ class SnV120Distribution(NamedTuple):
             H0, Hb = self.get_ground_hamiltonian(
                 idx=single_idx,
                 included_states=included_states,
-                experiment_idx=experiment_idx,
+                control_state=control_state,
             )
 
             H0_rads_s = 2.0 * jnp.pi * H0 * scale
@@ -2210,7 +2282,7 @@ class SnV120Distribution(NamedTuple):
         psi0=None,
         saveat_final_only=False,
         solver_options_args=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Construct the time grid and run one or more Hamiltonian evolutions.
 
@@ -2221,8 +2293,9 @@ class SnV120Distribution(NamedTuple):
             included_states: Tuple identifying the included eigenstates.
             psi0: Initial quantum state. Defaults to the first basis state.
             scale: Scale factor for the time array.
-            experiment_idx: Distribution member whose optimal vector-magnet
-                settings are applied to every member selected by ``idx``.
+            control_state: Explicit physical controls shared by every member
+                selected by ``idx``. Only ``magnet_settings`` is used here. If
+                ``None``, each member uses its own optimal magnet settings.
         Returns:
             A tuple containing the quantum states, filter states, and populations.
 
@@ -2258,7 +2331,7 @@ class SnV120Distribution(NamedTuple):
             included_states=tuple(included_states),
             saveat_final_only=saveat_final_only,
             solver_options_args=solver_options_args,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         if scalar_idx:
@@ -2286,7 +2359,7 @@ class SnV120Distribution(NamedTuple):
         included_states,
         saveat_downsampling=1,
         solver_options_args=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Run Hamiltonian evolutions for a batch of distribution indices.
 
@@ -2300,8 +2373,9 @@ class SnV120Distribution(NamedTuple):
             tau: Fixed-shape time array in seconds.
             psi0: Initial quantum state shared by all distribution members.
             included_states: Static tuple identifying the included eigenstates.
-            experiment_idx: Distribution member whose optimal vector-magnet
-                and waveplate settings are applied to every member in ``idx``.
+            control_state: Explicit vector-magnet and QWP-HWP-QWP controls
+                shared by every member in ``idx``. If ``None``, each member uses
+                its own optimal controls.
 
         Returns:
             A tuple ``(states, filter_states, populations)`` where every array leaf
@@ -2339,7 +2413,7 @@ class SnV120Distribution(NamedTuple):
             H0, Hb, Hs_optical, c_ops, optical_transition_offset = self.get_excitation_hamiltonian(
                 idx=single_idx,
                 included_states=included_states,
-                experiment_idx=experiment_idx,
+                control_state=control_state,
             )
             omega_r = 2*jnp.pi*(params.LEVEL_OFFSET  + self.strain_params[single_idx, 0] - self.constants.laser_frequency + optical_transition_offset) * scale
 
@@ -2433,7 +2507,7 @@ class SnV120Distribution(NamedTuple):
         rho0=None,
         saveat_downsampling=1,
         solver_options_args=None,
-        experiment_idx=None,
+        control_state: SnVControlState | None = None,
     ):
         """Construct the time grid and run one or more Hamiltonian evolutions.
 
@@ -2444,9 +2518,9 @@ class SnV120Distribution(NamedTuple):
             included_states: Tuple identifying the included eigenstates.
             rho0: Initial quantum state. Defaults to the first basis state.
             scale: Scale factor for the time array.
-            experiment_idx: Distribution member whose optimal vector-magnet
-                and waveplate settings are applied to every member selected by
-                ``idx``.
+            control_state: Explicit vector-magnet and QWP-HWP-QWP controls
+                shared by every member selected by ``idx``. If ``None``, each
+                member uses its own optimal controls.
         Returns:
             A tuple containing the quantum states, filter states, and populations.
 
@@ -2482,7 +2556,7 @@ class SnV120Distribution(NamedTuple):
             included_states=tuple(included_states),
             saveat_downsampling=saveat_downsampling,
             solver_options_args=solver_options_args,
-            experiment_idx=experiment_idx,
+            control_state=control_state,
         )
 
         if scalar_idx:
@@ -2978,3 +3052,45 @@ class SnV120Distribution(NamedTuple):
         result = self.get_waveplate_angles_batch(idx_array)
 
         return result[0] if scalar_idx else result
+
+    def get_optimal_control_state(self, idx=0) -> SnVControlState:
+        """Return the controls optimized for one distribution member.
+
+        This replaces the former index-selected shared-control behavior.
+        The selected member determines both:
+
+        - the physical vector-magnet settings that realize ``constants.B_target``;
+        - the QWP-HWP-QWP angles that best realize
+          ``constants.target_dipole_operator``.
+
+        Parameters
+        ----------
+        idx : int or length-one array_like, optional
+            Distribution member whose model is used to calculate the controls.
+
+        Returns
+        -------
+        SnVControlState
+            ``magnet_settings`` has shape ``(3,)`` in tesla and
+            ``waveplate_angles`` has shape ``(3,)`` in radians, ordered as
+            ``[QWP1, HWP, QWP2]``.
+        """
+        if idx is None:
+            raise ValueError(
+                "`idx` must identify exactly one distribution member; "
+                "it cannot be None."
+            )
+
+        idx_array = jnp.atleast_1d(
+            jnp.asarray(idx, dtype=jnp.int32)
+        )
+
+        if idx_array.ndim != 1 or idx_array.shape[0] != 1:
+            raise ValueError(
+                "`idx` must be a scalar integer or a length-one integer array."
+            )
+
+        return SnVControlState(
+            magnet_settings=self.get_B_settings_batch(idx_array)[0],
+            waveplate_angles=self.get_waveplate_angles_batch(idx_array)[0],
+        )
