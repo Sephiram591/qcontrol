@@ -14,7 +14,7 @@ with the following interactions:
 
 import numpy as np
 import qutip as qt
-import qcontrol.snv120.parameters as params
+import qcontrol.snv.parameters as params
 
 
 def create_hamiltonian_nuclear():

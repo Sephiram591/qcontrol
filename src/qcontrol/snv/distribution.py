@@ -6,13 +6,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import jax.scipy.special as jsp_special
-import qcontrol.snv120.parameters as params
-import qcontrol.snv120.hamiltonian_jqt as qh_jqt
-from qcontrol.snv120.jqt_ext import sesolve_components, mesolve_components
+import qcontrol.snv.parameters as params
+import qcontrol.snv.hamiltonian_jqt as qh_jqt
+from qcontrol.snv.jqt_ext import sesolve_components, mesolve_components
 import jaxquantum as jqt
 from pulseseq.sequencing.waveform import AnalogPulse, Apodization, Shape, DigitalPulse, DigitalType
-import qcontrol.snv120.pulseseq_interconnect
-from qcontrol.snv120.pulseseq_interconnect import stack_waveforms, make_analog_pulse_time_array, synthesize_analog_pulse
+import qcontrol.snv.pulseseq_interconnect
+from qcontrol.snv.pulseseq_interconnect import stack_waveforms, make_analog_pulse_time_array, synthesize_analog_pulse
 
 from pulseseq.sequencing.waveform import AnalogPulse, Apodization, Shape, DigitalPulse, DigitalType
 

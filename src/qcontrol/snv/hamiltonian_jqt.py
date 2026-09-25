@@ -58,7 +58,7 @@ import jax
 import jax.numpy as jnp
 import jaxquantum as jqt
 
-import qcontrol.snv120.parameters as params
+import qcontrol.snv.parameters as params
 
 
 # Package-level defaults.  SnV120Distribution supplies explicit A/Ax/Ay

@@ -381,6 +381,63 @@ def make_analog_pulse_time_array(
     return tau
 
 
+def make_readout_bin_times_fn(awg, pulse : AnalogPulse):
+    """Build a function that reproduces the AWG's exact readout bin times.
+
+    Mirrors the bin-time computation in
+    ``pulseseq.hardware.awg.qick.programs``: the number of bins is
+
+    ``bins = ceil(subseq_length_samples / modulo_samples / bin_period) + 1``
+
+    where ``subseq_length_samples`` is the pulse duration in raw DAC
+    samples (``(pulse.length + pulse.padding_length) * sample_rate`` --
+    ``pulseseq`` itself works in raw samples at this point, whereas this
+    factory's inputs are in seconds), and the bin times are
+
+    ``bin_time = (bin_period * arange(bins - 1) - bin_period) / sample_rate * modulo_samples``
+
+    Parameters
+    ----------
+    awg
+        A pulseseq AWG instance (e.g. ``QICK``). Its ``bin_period``,
+        ``modulo_samples``, and ``sample_rate`` are fixed hardware
+        constants and are captured once, at factory-construction time.
+    pulse : AnalogPulse
+        Only ``pulse.length`` and ``pulse.padding_length`` are used, to
+        determine the subsequence length that sets the number of bins.
+
+    Returns
+    -------
+    bin_times : jax.Array
+        The readout bin times in seconds.
+
+    Notes
+    -----
+    The bin count is a static, shape-determining quantity, so
+    ``pulse.length``/``pulse.padding_length`` are concretized with
+    ``float()`` here -- the same limitation documented on
+    ``make_analog_pulse_time_array``, meaning ``bin_times_fn`` must be
+    called eagerly (outside ``jax.jit``/``jax.grad`` tracing of whichever
+    leaves determine pulse length). The bin *values* are computed with
+    ``jnp`` from hardware constants alone (``bin_period``,
+    ``modulo_samples``, ``sample_rate``); they carry no dependence on
+    ``particle`` or ``control_state`` in this formula, so returning them
+    as ``jnp`` arrays keeps the result a proper JAX type that composes
+    safely with the rest of the differentiable pipeline, even though
+    gradients flowing back through the bin times themselves are zero.
+    """
+    bin_period = awg.bin_period
+    modulo_samples = awg.modulo_samples
+    sample_rate = awg.sample_rate
+    subseq_length_seconds = float(pulse.length) + float(pulse.padding_length)
+    subseq_length_samples = subseq_length_seconds * sample_rate
+
+    bins = int(jnp.ceil(subseq_length_samples / modulo_samples / bin_period)) + 1
+
+    raw_bin_time = bin_period * jnp.arange(bins - 1)
+    return (raw_bin_time - bin_period) / sample_rate * modulo_samples
+
+
 def _triangle_carrier(argument: jax.Array) -> jax.Array:
     """Evaluate the triangular equivalent of ``-sawtooth(argument, 0.5)``."""
     cycle_fraction = jnp.mod(argument / (2.0 * jnp.pi), 1.0)
@@ -686,3 +743,132 @@ def synthesize_analog_pulse(
         return waveform, envelope, tau
 
     return waveform
+
+
+def make_composite_waveform_time_array(
+    composite: CompositeWaveform,
+    sample_period: float = 4e-11,
+    at_time: float = 0.0,
+) -> jax.Array:
+    """Construct a fixed-shape time array for a composite waveform.
+
+    Like ``make_analog_pulse_time_array``, this helper runs outside
+    ``jax.jit`` because the number of samples depends on the numerical value
+    of the composite's duration and the sample period.
+
+    Parameters
+    ----------
+    composite : CompositeWaveform
+        Serialized composite-waveform parameters. The total duration is
+        ``composite.length``, which already spans every component pulse's
+        scheduled time and length (see ``CompositeWaveform.__init__`` in
+        ``pulseseq.sequencing.waveform``).
+
+    sample_period : float, default=4e-11
+        Time between adjacent samples, in seconds.
+
+    at_time : float, default=0.0
+        Time assigned to the center of the returned sample array, in seconds.
+
+    Returns
+    -------
+    tau : jax.Array
+        One-dimensional array containing the sample times, in seconds.
+    """
+    total_length = float(composite.length)
+
+    if sample_period <= 0:
+        raise ValueError("sample_period must be positive.")
+
+    number_of_samples = int(jnp.round(total_length / sample_period))
+
+    if number_of_samples < 2:
+        raise ValueError(
+            "At least two time samples are required. Increase the composite "
+            "waveform's duration or decrease sample_period."
+        )
+
+    tau = jnp.arange(number_of_samples, dtype=jnp.float64) * sample_period
+    tau = tau + at_time - jnp.mean(tau)
+    return tau
+
+
+@jax.jit(static_argnames=("all_info",))
+def synthesize_composite_waveform(
+    composite: CompositeWaveform,
+    tau: jax.Array,
+    at_time: float | None = None,
+    all_info: bool = False,
+    dphase: float = 0.0,
+):
+    """Synthesize a composite waveform assumed to contain only analog pulses.
+
+    Mirrors the analog branch of ``CompositeWaveform.synthesize`` (in
+    ``pulseseq.sequencing.waveform``): every component pulse is synthesized
+    on the same ``tau`` grid, offset by its own scheduled time relative to
+    the composite's center, and the results are summed.
+
+    Parameters
+    ----------
+    composite : CompositeWaveform
+        Serialized composite-waveform parameters. Every entry in
+        ``composite.waveforms`` is assumed to be an ``AnalogPulse``; this is
+        not checked at trace time, so passing a composite containing a
+        ``DigitalPulse`` or nested ``CompositeWaveform`` produces incorrect
+        results rather than an error.
+    tau : array_like
+        One-dimensional array of absolute sample times, in seconds, shared
+        by every component pulse.
+    at_time : float or None, default=None
+        Reference time corresponding to the nominal center of the composite
+        waveform, in seconds. When ``None``, the mean of ``tau`` is used.
+    all_info : bool, default=False
+        If ``False``, return only the waveform. If ``True``, return the
+        tuple ``(waveform, envelope, tau)``.
+    dphase : float, default=0.0
+        Additional carrier phase shift, in radians, passed through to every
+        component pulse.
+
+    Returns
+    -------
+    waveform : jax.Array
+        Synthesized waveform samples, summed over all component pulses.
+
+    envelope : jax.Array
+        Envelope samples, summed over all component pulses. Returned only
+        when ``all_info=True``.
+
+    tau : jax.Array
+        Input time array. Returned only when ``all_info=True``.
+    """
+    tau = jnp.asarray(tau)
+    resolved_at_time = jnp.mean(tau) if at_time is None else jnp.asarray(at_time)
+
+    pulses = (
+        composite.waveforms.values()
+        if isinstance(composite.waveforms, dict)
+        else composite.waveforms
+    )
+
+    # Pulse count is part of the pytree structure (static under jit), so this
+    # check is safe even though the pulses' numerical fields are tracers.
+    if len(pulses) == 0:
+        raise ValueError("composite must contain at least one analog pulse.")
+
+    results = [
+        synthesize_analog_pulse(
+            pulse,
+            tau,
+            at_time=resolved_at_time + t - composite.center,
+            all_info=all_info,
+            dphase=dphase,
+        )
+        for t, pulse in zip(composite.times, pulses)
+    ]
+
+    if all_info:
+        waveform = jnp.sum(jnp.stack([result[0] for result in results], axis=0), axis=0)
+        envelope = jnp.sum(jnp.stack([result[1] for result in results], axis=0), axis=0)
+        return waveform, envelope, tau
+
+    return jnp.sum(jnp.stack(results, axis=0), axis=0)
