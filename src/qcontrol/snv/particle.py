@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Literal, NamedTuple, Sequence
+from typing import NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
 
 
 Array = jax.Array
-PyTree = Any
-JacobianMode = Literal["fwd", "rev"]
 
 
 class SnVDifferentiableParams(NamedTuple):
@@ -138,16 +136,6 @@ class SnVParticle(NamedTuple):
         return SnVParticle(diffable=diffable, nondiff=self.nondiff)
 
 
-class SnVControlState(NamedTuple):
-    """Physical controls applied to one or more SnV particles."""
-
-    magnet_settings: Array
-    # Shape (3,). Physical vector-magnet settings, in tesla.
-
-    waveplate_angles: Array
-    # Shape (3,). [QWP1, HWP, QWP2] angles, in radians.
-
-
 class SnVDistribution(NamedTuple):
     """Weighted structure-of-arrays container of SnV particles."""
 
@@ -213,159 +201,3 @@ class SnVDistribution(NamedTuple):
     def normalized_weights(self) -> Array:
         """Return weights normalized to sum to one."""
         return self.weights / jnp.sum(self.weights)
-
-
-def stop_gradient_tree(tree: PyTree) -> PyTree:
-    """Apply ``stop_gradient`` to every pytree leaf."""
-    return jax.tree_util.tree_map(jax.lax.stop_gradient, tree)
-
-
-def diffable_form(
-    helper: Callable[[SnVParticle, SnVControlState], PyTree],
-) -> Callable[[SnVDifferentiableParams, SnVNonDiffParams, SnVControlState], PyTree]:
-    """Expose the differentiable subtree as a helper's first argument."""
-
-    def helper_from_diffable(diffable, nondiff, control_state):
-        return helper(SnVParticle(diffable, nondiff), control_state)
-
-    return helper_from_diffable
-
-
-ParticleHelper = Callable[[SnVParticle, SnVControlState], PyTree]
-ParticleLoss = Callable[[SnVParticle, SnVControlState], Array]
-
-
-def make_batched_helper(helper: ParticleHelper) -> Callable:
-    """Vectorize a helper over particles under one shared control state."""
-    return jax.jit(jax.vmap(helper, in_axes=(0, None), out_axes=0))
-
-
-def make_batched_helper_with_particle_controls(helper: ParticleHelper) -> Callable:
-    """Vectorize a helper over matched particle and control batches."""
-    return jax.jit(jax.vmap(helper, in_axes=(0, 0), out_axes=0))
-
-
-def make_single_particle_jacobian(
-    helper: ParticleHelper, *, mode: JacobianMode = "rev"
-) -> Callable:
-    """Differentiate one helper with respect to ``SnVDifferentiableParams``."""
-    transformed = diffable_form(helper)
-    if mode == "rev":
-        jacobian = jax.jacrev(transformed, argnums=0)
-    elif mode == "fwd":
-        jacobian = jax.jacfwd(transformed, argnums=0)
-    else:
-        raise ValueError("`mode` must be 'fwd' or 'rev'.")
-    return jax.jit(jacobian)
-
-
-def make_batched_particle_jacobian(
-    helper: ParticleHelper, *, mode: JacobianMode = "rev"
-) -> Callable:
-    """Return one independent parameter Jacobian per particle."""
-    transformed = diffable_form(helper)
-    if mode == "rev":
-        jacobian_one = jax.jacrev(transformed, argnums=0)
-    elif mode == "fwd":
-        jacobian_one = jax.jacfwd(transformed, argnums=0)
-    else:
-        raise ValueError("`mode` must be 'fwd' or 'rev'.")
-    return jax.jit(jax.vmap(jacobian_one, in_axes=(0, 0, None), out_axes=0))
-
-
-def make_single_control_jacobian(
-    helper: ParticleHelper, *, mode: JacobianMode = "rev"
-) -> Callable:
-    """Differentiate one helper with respect to its control state."""
-    if mode == "rev":
-        jacobian = jax.jacrev(helper, argnums=1)
-    elif mode == "fwd":
-        jacobian = jax.jacfwd(helper, argnums=1)
-    else:
-        raise ValueError("`mode` must be 'fwd' or 'rev'.")
-    return jax.jit(jacobian)
-
-
-def make_batched_control_jacobian(
-    helper: ParticleHelper, *, mode: JacobianMode = "rev"
-) -> Callable:
-    """Return one independent control Jacobian per particle, under one shared
-    control state."""
-    if mode == "rev":
-        jacobian_one = jax.jacrev(helper, argnums=1)
-    elif mode == "fwd":
-        jacobian_one = jax.jacfwd(helper, argnums=1)
-    else:
-        raise ValueError("`mode` must be 'fwd' or 'rev'.")
-    return jax.jit(jax.vmap(jacobian_one, in_axes=(0, None), out_axes=0))
-
-
-def make_batched_control_jacobian_with_particle_controls(
-    helper: ParticleHelper, *, mode: JacobianMode = "rev"
-) -> Callable:
-    """Return one independent control Jacobian per matched particle/control pair."""
-    if mode == "rev":
-        jacobian_one = jax.jacrev(helper, argnums=1)
-    elif mode == "fwd":
-        jacobian_one = jax.jacfwd(helper, argnums=1)
-    else:
-        raise ValueError("`mode` must be 'fwd' or 'rev'.")
-    return jax.jit(jax.vmap(jacobian_one, in_axes=(0, 0), out_axes=0))
-
-
-def make_batched_particle_value_and_grad(loss: ParticleLoss) -> Callable:
-    """Return one real scalar loss and parameter gradient per particle."""
-    value_and_grad_one = jax.value_and_grad(diffable_form(loss), argnums=0)
-    return jax.jit(
-        jax.vmap(value_and_grad_one, in_axes=(0, 0, None), out_axes=(0, 0))
-    )
-
-
-def make_weighted_distribution_value_and_grad(loss: ParticleLoss) -> Callable:
-    """Differentiate a weighted loss with respect to all particle parameters."""
-    loss_batch = jax.vmap(loss, in_axes=(0, None), out_axes=0)
-
-    def objective(diffable, nondiff, weights, control_state):
-        losses = loss_batch(SnVParticle(diffable, nondiff), control_state)
-        weights = weights / jnp.sum(weights)
-        return jnp.sum(weights * losses)
-
-    return jax.jit(jax.value_and_grad(objective, argnums=0))
-
-
-def make_particle_control_value_and_grad(loss: ParticleLoss) -> Callable:
-    """Differentiate one particle's scalar loss with respect to its control state."""
-    return jax.jit(jax.value_and_grad(loss, argnums=1))
-
-
-def make_weighted_control_value_and_grad(loss: ParticleLoss) -> Callable:
-    """Differentiate a weighted particle loss with respect to shared controls."""
-    loss_batch = jax.vmap(loss, in_axes=(0, None), out_axes=0)
-
-    def objective(particles, weights, control_state):
-        weights = weights / jnp.sum(weights)
-        return jnp.sum(weights * loss_batch(particles, control_state))
-
-    return jax.jit(jax.value_and_grad(objective, argnums=2))
-
-
-def example_vector_helper(
-    particle: SnVParticle, control_state: SnVControlState
-) -> Array:
-    """Small vector-valued example using both parameter subtrees."""
-    d, n = particle.diffable, particle.nondiff
-    factors = jnp.asarray([1.0, -1.0, 0.5, -0.5], dtype=d.strain_params.dtype)
-    return jnp.stack(
-        [
-            jnp.sum(d.magnet_unit_magnitude * control_state.magnet_settings),
-            d.strain_params[0]
-            + factors[n.dipole_crystal_axis_idx] * d.strain_params[1],
-        ]
-    )
-
-
-def example_scalar_loss(
-    particle: SnVParticle, control_state: SnVControlState
-) -> Array:
-    """Real scalar example suitable for gradient transformations."""
-    return jnp.sum(example_vector_helper(particle, control_state) ** 2)

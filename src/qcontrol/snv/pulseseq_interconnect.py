@@ -435,51 +435,13 @@ def make_readout_bin_times_fn(awg, pulse : AnalogPulse):
     bins = int(jnp.ceil(subseq_length_samples / modulo_samples / bin_period)) + 1
 
     raw_bin_time = bin_period * jnp.arange(bins - 1)
-    return (raw_bin_time - bin_period) / sample_rate * modulo_samples
+    return (raw_bin_time) / sample_rate * modulo_samples
 
 
 def _triangle_carrier(argument: jax.Array) -> jax.Array:
     """Evaluate the triangular equivalent of ``-sawtooth(argument, 0.5)``."""
     cycle_fraction = jnp.mod(argument / (2.0 * jnp.pi), 1.0)
     return 4.0 * jnp.abs(cycle_fraction - 0.5) - 1.0
-
-
-def _analytic_signal_envelope(signal: jax.Array) -> jax.Array:
-    """Calculate a Hilbert-transform envelope using the FFT."""
-    number_of_samples = signal.shape[0]
-
-    if number_of_samples % 2 == 0:
-        multiplier = jnp.concatenate(
-            (
-                jnp.ones((1,), dtype=signal.dtype),
-                2.0 * jnp.ones(
-                    (number_of_samples // 2 - 1,),
-                    dtype=signal.dtype,
-                ),
-                jnp.ones((1,), dtype=signal.dtype),
-                jnp.zeros(
-                    (number_of_samples // 2 - 1,),
-                    dtype=signal.dtype,
-                ),
-            )
-        )
-    else:
-        multiplier = jnp.concatenate(
-            (
-                jnp.ones((1,), dtype=signal.dtype),
-                2.0 * jnp.ones(
-                    ((number_of_samples - 1) // 2,),
-                    dtype=signal.dtype,
-                ),
-                jnp.zeros(
-                    ((number_of_samples - 1) // 2,),
-                    dtype=signal.dtype,
-                ),
-            )
-        )
-
-    analytic_signal = jnp.fft.ifft(jnp.fft.fft(signal) * multiplier)
-    return jnp.abs(analytic_signal)
 
 
 @jax.jit(static_argnames=("all_info",))
@@ -489,18 +451,24 @@ def synthesize_analog_pulse(
     at_time: float | None = None,
     all_info: bool = False,
     dphase: float = 0.0,
+    dt: float | None = None,
 ):
     """Synthesize an analog pulse from serialized pulse parameters.
+
+    The S21 bandwidth pre-correction (``pulse.S21_correct``, ``pulse.w_3db``)
+    is not applied; those fields are ignored.
 
     Parameters
     ----------
     pulse : AnalogPulse
     tau : array_like
-        One-dimensional array of absolute sample times, in seconds.
+        Absolute sample times, in seconds. Either a one-dimensional array of
+        samples, or a scalar (or any shape) when ``dt`` is given; the waveform
+        is evaluated elementwise.
 
         Unlike the original NumPy method, this JIT-compiled function requires
-        ``tau`` to be an array rather than a scalar sample period. JAX needs
-        the number of output samples to be known when the function is
+        ``tau`` to be sample times rather than a scalar sample period. JAX
+        needs the number of output samples to be known when the function is
         compiled. Use ``make_analog_pulse_time_array`` outside ``jax.jit`` to
         create ``tau`` from a sample period.
 
@@ -524,6 +492,11 @@ def synthesize_analog_pulse(
     dphase : float, default=0.0
         Additional carrier phase shift, in radians. Exponential pulses add
         ``pi / 2`` to this value, matching the original implementation.
+
+    dt : float or None, default=None
+        Sample period, in seconds, used by the square envelope's leading
+        edge. When ``None``, it is inferred as the mean spacing of ``tau``,
+        which then must contain at least two samples.
 
     Returns
     -------
@@ -552,17 +525,15 @@ def synthesize_analog_pulse(
     frequency = pulse.frequency
     frequency_chirp = pulse.frequency_chirp
     shape = pulse.shape
-    s21_correct = pulse.S21_correct
-    w_3db = pulse.w_3db
     phase_offset = pulse.phase_offset
     dphase = dphase
 
     center = resolved_at_time + shift
-    dt = jnp.mean(jnp.diff(tau))
+    dt = jnp.mean(jnp.diff(tau)) if dt is None else jnp.asarray(dt)
     start = center - length / 2.0
     end = center + length / 2.0
 
-    def cosine_envelope(_):
+    def cosine_envelope():
         half_apodization = apodization_length / 2.0
 
         # Avoid division by zero in the unselected JAX branch.
@@ -612,37 +583,45 @@ def synthesize_analog_pulse(
         )
         return envelope
 
-    def gaussian_envelope(_):
+    def gaussian_envelope():
         safe_length = jnp.where(length == 0.0, 1.0, length)
         envelope = jnp.exp(
             -jnp.square(2.0 * (tau - center) / safe_length)
         )
         return jnp.where(length == 0.0, 0.0, envelope)
 
-    def square_envelope(_):
+    def square_envelope():
         envelope = jnp.ones_like(tau)
         envelope = jnp.where(tau < start - dt, 0.0, envelope)
         envelope = jnp.where(tau > end, 0.0, envelope)
         return envelope
 
-    def exponential_envelope(_):
+    def exponential_envelope():
         safe_length = jnp.where(length == 0.0, 1.0, length)
         exponential_start = center - length / 2.0
         local_time = tau - exponential_start
 
-        envelope = jnp.exp(-local_time / safe_length)
+        # Clamp so exp cannot overflow before the pulse starts; an inf here
+        # would turn into NaN gradients through the selections below.
+        envelope = jnp.exp(-jnp.maximum(local_time, 0.0) / safe_length)
         envelope = jnp.where(local_time < 0.0, 0.0, envelope)
         return jnp.where(length == 0.0, 0.0, envelope)
 
-    envelope = jax.lax.switch(
-        apodization,
+    # Evaluate every envelope and select, instead of lax.switch on the traced
+    # apodization index: this runs inside ODE right-hand sides, where a
+    # runtime branch costs more than evaluating all four cheap envelopes.
+    envelope = jnp.select(
         (
-            cosine_envelope,
-            gaussian_envelope,
-            square_envelope,
-            exponential_envelope,
+            apodization == Apodization.COSINE,
+            apodization == Apodization.GAUSSIAN,
+            apodization == Apodization.SQUARE,
         ),
-        operand=None,
+        (
+            cosine_envelope(),
+            gaussian_envelope(),
+            square_envelope(),
+        ),
+        default=exponential_envelope(),
     )
 
     envelope = amplitude * envelope
@@ -699,43 +678,15 @@ def synthesize_analog_pulse(
     sinusoidal_carrier = jnp.cos(argument)
     triangular_carrier = _triangle_carrier(argument)
 
-    carrier = jax.lax.switch(
-        shape,
-        (
-            lambda _: sinusoidal_carrier,
-            lambda _: triangular_carrier,
-        ),
-        operand=None,
+    carrier = jnp.where(
+        shape == Shape.TRIANGLE,
+        triangular_carrier,
+        sinusoidal_carrier,
     )
 
     waveform = jnp.where(
         has_carrier,
         envelope * carrier,
-        envelope,
-    )
-
-    # Protect against division by zero in the unselected branch.
-    safe_w_3db = jnp.where(w_3db == 0.0, 1.0, w_3db)
-    corrected_waveform = (
-        waveform
-        + jnp.gradient(waveform, dt) / safe_w_3db
-    )
-    corrected_waveform /= jnp.max(jnp.abs(corrected_waveform))
-    corrected_envelope = _analytic_signal_envelope(
-        corrected_waveform
-    )
-    corrected_envelope /= jnp.max(jnp.abs(corrected_envelope))*amplitude
-
-    apply_correction = s21_correct & (w_3db != 0.0)
-
-    waveform = jnp.where(
-        apply_correction,
-        corrected_waveform,
-        waveform,
-    )
-    envelope = jnp.where(
-        apply_correction,
-        corrected_envelope,
         envelope,
     )
 
@@ -800,6 +751,7 @@ def synthesize_composite_waveform(
     at_time: float | None = None,
     all_info: bool = False,
     dphase: float = 0.0,
+    dt: float | None = None,
 ):
     """Synthesize a composite waveform assumed to contain only analog pulses.
 
@@ -817,8 +769,8 @@ def synthesize_composite_waveform(
         ``DigitalPulse`` or nested ``CompositeWaveform`` produces incorrect
         results rather than an error.
     tau : array_like
-        One-dimensional array of absolute sample times, in seconds, shared
-        by every component pulse.
+        Absolute sample times, in seconds, shared by every component pulse.
+        A scalar (or any shape) is allowed when ``dt`` is given.
     at_time : float or None, default=None
         Reference time corresponding to the nominal center of the composite
         waveform, in seconds. When ``None``, the mean of ``tau`` is used.
@@ -828,6 +780,9 @@ def synthesize_composite_waveform(
     dphase : float, default=0.0
         Additional carrier phase shift, in radians, passed through to every
         component pulse.
+    dt : float or None, default=None
+        Sample period, in seconds, passed through to every component pulse
+        (see ``synthesize_analog_pulse``). Required for scalar ``tau``.
 
     Returns
     -------
@@ -862,6 +817,7 @@ def synthesize_composite_waveform(
             at_time=resolved_at_time + t - composite.center,
             all_info=all_info,
             dphase=dphase,
+            dt=dt,
         )
         for t, pulse in zip(composite.times, pulses)
     ]

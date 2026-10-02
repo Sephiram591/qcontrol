@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from functools import partial
-from typing import Literal
+from typing import Literal, NamedTuple, Tuple, Any, Callable
 
 from jax import config
 
@@ -23,14 +23,12 @@ import jax.scipy.special as jsp_special
 import jaxquantum as jqt
 import numpy as np
 
-from . import hamiltonian_jqt as qh_jqt
-from . import parameters as params
-from .jqt_ext import mesolve_components, sesolve_components
-from .particle import SnVControlState, SnVParticle
-from .pulseseq_interconnect import (
-    make_analog_pulse_time_array,
+from qcontrol.snv import hamiltonian_jqt as qh_jqt
+from qcontrol.snv import parameters as params
+from qcontrol.snv.jqt_ext import mesolve_components, sesolve_components
+from qcontrol.snv.particle import SnVParticle, SnVDifferentiableParams, SnVNonDiffParams
+from qcontrol.snv.pulseseq_interconnect import (
     make_composite_waveform_time_array,
-    synthesize_analog_pulse,
     synthesize_composite_waveform
 )
 
@@ -38,6 +36,42 @@ from .pulseseq_interconnect import (
 Array = jax.Array
 Frame = Literal["lab", "crystal", "dipole"]
 
+
+# -----------------------------------------------------------------------------
+# General numerical helpers
+# -----------------------------------------------------------------------------
+
+class SnVControlState(NamedTuple):
+    """Physical controls applied to one or more SnV particles."""
+
+    magnet_settings: Array
+    # Shape (3,). Physical vector-magnet settings, in tesla.
+
+    waveplate_angles: Array
+    # Shape (3,). [QWP1, HWP, QWP2] angles, in radians.
+
+    @classmethod
+    @jax.jit(static_argnames="cls")
+    def from_targets(cls,
+        particle: SnVParticle,
+        B_target: Array,
+        target_dipole_operator: Array,
+    ):
+        """Return magnet and waveplate controls optimized for one particle.
+
+        Parameters
+        ----------
+        particle
+            Unbatched particle parameters.
+        B_target : array_like, shape (3,)
+            Target electron-Zeeman vector in the dipole frame, in GHz.
+        target_dipole_operator : array_like, shape (3,)
+            Target optical dipole-operator direction in the dipole frame.
+        """
+        return cls(
+            magnet_settings=get_B_settings(particle, B_target),
+            waveplate_angles=get_waveplate_angles(particle, target_dipole_operator),
+        )
 
 # -----------------------------------------------------------------------------
 # General numerical helpers
@@ -203,8 +237,8 @@ def _bessel_j_nonnegative_orders_integer_series(
 
 def _validate_control_state(control_state: SnVControlState) -> SnVControlState:
     """Normalize and validate one physical control state."""
-    if not isinstance(control_state, SnVControlState):
-        raise TypeError("`control_state` must be an SnVControlState.")
+    # if not isinstance(control_state, SnVControlState):
+    #     raise TypeError("`control_state` must be an SnVControlState.")
     magnet_settings = jnp.asarray(control_state.magnet_settings)
     waveplate_angles = jnp.asarray(control_state.waveplate_angles)
     if magnet_settings.shape != (3,):
@@ -453,27 +487,27 @@ def get_waveplate_angles(
     return jnp.stack((qwp1 % jnp.pi, hwp % (0.5 * jnp.pi), qwp2 % jnp.pi))
 
 
-@jax.jit
-def get_optimal_control_state(
-    particle: SnVParticle,
-    B_target: Array,
-    target_dipole_operator: Array,
-) -> SnVControlState:
-    """Return magnet and waveplate controls optimized for one particle.
+# @jax.jit
+# def get_optimal_control_state(
+#     particle: SnVParticle,
+#     B_target: Array,
+#     target_dipole_operator: Array,
+# ) -> SnVControlState:
+#     """Return magnet and waveplate controls optimized for one particle.
 
-    Parameters
-    ----------
-    particle
-        Unbatched particle parameters.
-    B_target : array_like, shape (3,)
-        Target electron-Zeeman vector in the dipole frame, in GHz.
-    target_dipole_operator : array_like, shape (3,)
-        Target optical dipole-operator direction in the dipole frame.
-    """
-    return SnVControlState(
-        magnet_settings=get_B_settings(particle, B_target),
-        waveplate_angles=get_waveplate_angles(particle, target_dipole_operator),
-    )
+#     Parameters
+#     ----------
+#     particle
+#         Unbatched particle parameters.
+#     B_target : array_like, shape (3,)
+#         Target electron-Zeeman vector in the dipole frame, in GHz.
+#     target_dipole_operator : array_like, shape (3,)
+#         Target optical dipole-operator direction in the dipole frame.
+#     """
+#     return SnVControlState(
+#         magnet_settings=get_B_settings(particle, B_target),
+#         waveplate_angles=get_waveplate_angles(particle, target_dipole_operator),
+#     )
 
 
 # -----------------------------------------------------------------------------
@@ -772,7 +806,7 @@ def get_ple_freqs(
 def get_state_frequencies(
     particle: SnVParticle,
     control_state: SnVControlState,
-) -> Array:
+) -> Tuple[Array, Array]:
     """Return the relative frequency of all excited and ground states, with the ground states centered at 0"""
     E_gnd = solve_hamiltonian(particle, control_state, ground_state=True)[0]
     E_exc = solve_hamiltonian(particle, control_state, ground_state=False)[0]
@@ -1029,15 +1063,14 @@ def _drive_mw_hamiltonian(
 
     def H_b_drive(t, args=None):
         del args
-        local_times = jnp.stack((t - sample_period, t, t + sample_period))
-        waveform, _, _ = synthesize_analog_pulse(
-            pulse=pulse,
-            tau=local_times,
+        return synthesize_composite_waveform(
+            composite=pulse,
+            tau=t,
             at_time=pulse_center,
             dphase=0.0,
-            all_info=True,
+            all_info=False,
+            dt=sample_period,
         )
-        return waveform[1]
 
     H0, Hb = get_ground_hamiltonian(
         particle, control_state, included_states=included_states
@@ -1066,14 +1099,15 @@ def drive_mw_hamiltonian(
     saveat_final_only=False,
     solver_options_args=None,
 ):
-    """Evolve one particle under a synthesized microwave pulse.
+    """Evolve one particle under a synthesized microwave composite waveform.
 
     Parameters
     ----------
     particle, control_state
         Particle parameters and applied controls.
     pulse
-        Analog microwave pulse.
+        Microwave ``CompositeWaveform`` of analog pulses; its components are
+        summed into one drive and its center is placed at ``pulse.length / 2``.
     included_states
         Static tuple of retained ground-manifold eigenstates.
     psi0
@@ -1095,11 +1129,11 @@ def drive_mw_hamiltonian(
     if psi0 is None:
         psi0 = jqt.basis(len(included_states), 0)
     scale = 1e9
-    sample_period = 1.0 / float(np.asarray(particle.nondiff.sampling_rate) * scale)
-    tau = make_analog_pulse_time_array(
-        pulse=pulse,
+    sample_period = 1.0 / float(jnp.asarray(particle.nondiff.sampling_rate) * scale)
+    tau = make_composite_waveform_time_array(
+        composite=pulse,
         sample_period=sample_period,
-        at_time=float(np.asarray(pulse.length)) / 2.0,
+        at_time=float(jnp.asarray(pulse.length)) / 2.0,
     )
     return _drive_mw_hamiltonian(
         particle,
@@ -1111,6 +1145,361 @@ def drive_mw_hamiltonian(
         saveat_final_only=saveat_final_only,
         solver_options_args=solver_options_args,
     )
+
+
+@partial(
+    jax.jit,
+    static_argnames=("included_states", "saveat_final_only", "solver_options_args"),
+)
+def _drive_mw_hamiltonian_mixed(
+    particle: SnVParticle,
+    control_state: SnVControlState,
+    pulse,
+    tau,
+    rho0,
+    included_states,
+    collapse_operators=None,
+    saveat_final_only=False,
+    solver_options_args=None,
+):
+    scale = 1e9
+    dimension = len(included_states)
+    sample_period = 1.0 / (particle.nondiff.sampling_rate * scale)
+    pulse_center = pulse.length / 2
+    if not isinstance(rho0, jqt.Qarray):
+        rho0 = jqt.Qarray.create(jnp.asarray(rho0), dims=(dimension,))
+
+    def H_b_drive(t, args=None):
+        del args
+        return synthesize_composite_waveform(
+            composite=pulse,
+            tau=t,
+            at_time=pulse_center,
+            dphase=0.0,
+            all_info=False,
+            dt=sample_period,
+        )
+
+    H0, Hb = get_ground_hamiltonian(
+        particle, control_state, included_states=included_states
+    )
+    omega_c = 2.0 * jnp.pi * particle.diffable.mw_B_bandwidth * scale
+    states, filter_states = mesolve_components(
+        hamiltonians=(2.0 * jnp.pi * H0 * scale, 2.0 * jnp.pi * Hb * scale),
+        coefficients=(1.0, H_b_drive),
+        rho0=rho0,
+        tlist=tau,
+        saveat_tlist=tau[-2:] if saveat_final_only else tau,
+        collapse_operators=(
+            None if collapse_operators is None
+            else collapse_operators * jnp.sqrt(scale)
+        ),
+        filters=(None, lowpass_filter(omega_c)),
+        filter_y0s=(None, jnp.asarray(0.0, dtype=jnp.complex128)),
+        return_filter_states=True,
+        solver_options=_solver_options(solver_options_args),
+    )
+    return states, filter_states, _populations(states, dimension)
+
+
+def drive_mw_hamiltonian_mixed(
+    particle: SnVParticle,
+    control_state: SnVControlState,
+    pulse,
+    included_states=(0, 1, 2, 3),
+    rho0=None,
+    collapse_operators=None,
+    saveat_final_only=False,
+    solver_options_args=None,
+):
+    """Evolve one particle's density matrix under a microwave composite waveform.
+
+    Density-matrix counterpart of :func:`drive_mw_hamiltonian`, solved with a
+    Lindblad master equation so mixed initial states and decoherence are
+    supported.
+
+    Parameters
+    ----------
+    particle, control_state
+        Particle parameters and applied controls.
+    pulse
+        Microwave ``CompositeWaveform`` of analog pulses; its components are
+        summed into one drive and its center is placed at ``pulse.length / 2``.
+    included_states
+        Static tuple of retained ground-manifold eigenstates.
+    rho0
+        Initial density matrix in the retained eigenbasis, shape
+        ``(len(included_states), len(included_states))``. Defaults to the
+        first retained basis state.
+    collapse_operators : array_like, shape (K, d, d), optional
+        Collapse operators in the retained eigenbasis, in units of
+        ``sqrt(GHz)`` (i.e. ``sqrt(rate in GHz)`` times a dimensionless
+        operator). ``None`` gives unitary evolution.
+    saveat_final_only
+        Save only the final solver interval when true.
+    solver_options_args
+        Optional positional arguments for ``SolverOptions.create``.
+
+    Returns
+    -------
+    states, filter_states, populations
+        Density matrices, internal filter states, and basis populations.
+    """
+    included_states = tuple(included_states)
+    solver_options_args = (
+        None if solver_options_args is None else tuple(solver_options_args)
+    )
+    if rho0 is None:
+        rho0 = jqt.ket2dm(jqt.basis(len(included_states), 0))
+    scale = 1e9
+    sample_period = 1.0 / float(jnp.asarray(particle.nondiff.sampling_rate) * scale)
+    tau = make_composite_waveform_time_array(
+        composite=pulse,
+        sample_period=sample_period,
+        at_time=float(jnp.asarray(pulse.length)) / 2.0,
+    )
+    return _drive_mw_hamiltonian_mixed(
+        particle,
+        control_state,
+        pulse,
+        tau,
+        rho0,
+        included_states,
+        collapse_operators=collapse_operators,
+        saveat_final_only=saveat_final_only,
+        solver_options_args=solver_options_args,
+    )
+
+
+def expand_excited_rho(rho) -> Array:
+    """Embed a ground-manifold density matrix in the optical basis.
+
+    Parameters
+    ----------
+    rho : jaxquantum.Qarray or array_like, shape (..., N, N)
+        Density matrix over ``N`` retained ground states.
+
+    Returns
+    -------
+    jax.Array, shape (..., 2N + 1, 2N + 1)
+        Density matrix in the ``ground + excited + dark`` basis used by the
+        optical solvers, with zero population and coherence in the ``N``
+        excited states and the dark state.
+    """
+    rho = _to_dense(rho)
+    pad = [(0, 0)] * (rho.ndim - 2) + [(0, rho.shape[-1] + 1)] * 2
+    return jnp.pad(rho, pad)
+
+
+def collapse_excited_rho(rho, branching_ratios, included_states=(0, 1, 2, 3)) -> Array:
+    """Project an optical-basis density matrix back onto the ground manifold.
+
+    The excited and dark rows/columns are removed from the matrix, so the
+    output has only the ``N`` ground dimensions: ``(..., 2N + 1, 2N + 1)``
+    becomes ``(..., N, N)``. Inverse of :func:`expand_excited_rho` for a
+    state with no excited or dark population.
+
+    Population of each excited state decays incoherently into the retained
+    ground states with its spontaneous-emission branching ratios. Population
+    decaying to omitted ground states, and any population already in the dark
+    state, is discarded, and the result is renormalized to unit trace.
+    Ground-excited and excited-excited coherences are dropped, as a
+    spontaneous-emission jump would.
+
+    Parameters
+    ----------
+    rho : jaxquantum.Qarray or array_like, shape (..., 2N + 1, 2N + 1)
+        Density matrix in the ``ground + excited + dark`` basis, where
+        ``N = len(included_states)``.
+    branching_ratios : array_like, shape (N_exc, N_gnd)
+        Full branching ratios, e.g. from :func:`get_folded_branching_ratios`.
+    included_states
+        Static tuple of retained matched ground/excited eigenstate indices.
+
+    Returns
+    -------
+    jax.Array, shape (..., N, N)
+        Normalized ground-manifold density matrix.
+    """
+    rho = _to_dense(rho)
+    idx = jnp.asarray(tuple(included_states), dtype=jnp.int32)
+    n = idx.shape[0]
+    if rho.shape[-1] != 2 * n + 1 or rho.shape[-2] != 2 * n + 1:
+        raise ValueError("`rho` must have shape (..., 2N + 1, 2N + 1).")
+    branching = jnp.asarray(branching_ratios)[jnp.ix_(idx, idx)]  # (N_e, N_g)
+    rho_gg = rho[..., :n, :n]
+    exc_pops = jnp.real(
+        jnp.diagonal(rho[..., n : 2 * n, n : 2 * n], axis1=-2, axis2=-1)
+    )
+    decayed = jnp.einsum("...e,eg->...g", exc_pops, branching.astype(exc_pops.dtype))
+    eye = jnp.eye(n, dtype=rho.dtype)
+    rho_new = rho_gg + eye * decayed[..., None, :].astype(rho.dtype)
+    trace = jnp.trace(rho_new, axis1=-2, axis2=-1)
+    return rho_new / trace[..., None, None]
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "included_states",
+        "saveat_final_only",
+        "solver_options_args",
+        "chunk_size",
+        "substeps",
+    ),
+)
+def _drive_mw_hamiltonian_piecewise_mixed(
+    particle: SnVParticle,
+    control_state: SnVControlState,
+    pulse,
+    tau,
+    rho0,
+    included_states,
+    collapse_operators=None,
+    saveat_final_only=False,
+    solver_options_args=None,
+    chunk_size=16,
+    substeps=10,
+):
+    """Piecewise-constant Lindblad propagation of :func:`_drive_mw_hamiltonian_mixed`.
+
+    Each interval ``[tau[j], tau[j + 1])`` is split into ``substeps`` steps.
+    On every step the pulse waveform is evaluated at the step midpoint, passed
+    through the exact first-order low-pass recursion (the filter output is
+    averaged over the step), and the Liouvillian is held constant, so the
+    step propagator is ``expm(L_k dt)``. Time is processed in chunks: inside a
+    chunk the filter recursion and the product of step propagators are both
+    parallel prefix scans, and the state is carried across chunks with
+    ``lax.scan``.
+
+    Parameters
+    ----------
+    particle, control_state, pulse, tau, rho0, included_states
+        As in :func:`_drive_mw_hamiltonian_mixed`.
+    collapse_operators : array_like, shape (K, d, d), optional
+        In units of ``sqrt(GHz)``; ``None`` gives unitary evolution.
+    saveat_final_only
+        Return only the states at ``tau[-2:]`` when true, and never store the
+        full trajectory.
+    solver_options_args
+        Unused; accepted for signature compatibility.
+    chunk_size : int
+        Number of drive samples (``substeps`` steps each) per chunk. Peak
+        memory per run is a few ``chunk_size * substeps * d**4`` complex
+        numbers; larger chunks shorten the sequential depth.
+    substeps : int
+        Constant-Hamiltonian steps per drive sample.
+
+    Returns
+    -------
+    states, filter_states, populations
+        As in :func:`_drive_mw_hamiltonian_mixed`, with ``filter_states`` the
+        tuple ``(None, z)`` where ``z`` is the low-pass filter output at the
+        saved times.
+    """
+    del solver_options_args
+    scale = 1e9
+    dimension = len(included_states)
+    sample_period = 1.0 / (particle.nondiff.sampling_rate * scale)
+    pulse_center = pulse.length / 2
+    dt = sample_period / substeps
+    num_intervals = tau.shape[0] - 1
+    num_chunks = -(-num_intervals // chunk_size)
+    chunk_steps = chunk_size * substeps
+    last_step = num_intervals * substeps
+    sample_ends = substeps - 1 + substeps * np.arange(chunk_size)
+
+    H0, Hb = get_ground_hamiltonian(
+        particle, control_state, included_states=included_states
+    )
+    if collapse_operators is None:
+        c_ops = jnp.zeros((1, dimension, dimension), dtype=jnp.complex128)
+    else:
+        c_ops = _to_dense(collapse_operators) * jnp.sqrt(scale)
+    no_c_ops = jnp.zeros_like(c_ops[:1])
+    L0 = get_multitone_liouvillian(2.0 * jnp.pi * H0 * scale, c_ops)
+    Lb = get_multitone_liouvillian(2.0 * jnp.pi * Hb * scale, no_c_ops)
+    dtype = L0.dtype
+
+    omega_c = 2.0 * jnp.pi * particle.diffable.mw_B_bandwidth * scale
+    decay = jnp.exp(-omega_c * dt)
+    average_weight = (1.0 - decay) / (omega_c * dt)
+
+    rho0 = _to_dense(rho0).astype(dtype)
+    if rho0.shape[-1] == 1:  # ket
+        rho0 = rho0 @ jnp.conj(rho0).T
+    rho0_vec = rho0.reshape(-1)
+    identity = jnp.eye(dimension**2, dtype=dtype)
+    z_start = jnp.zeros((), dtype=dtype)
+
+    def affine_compose(first, second):
+        a1, b1 = first
+        a2, b2 = second
+        return a2 * a1, a2 * b1 + b2
+
+    def chunk(carry, chunk_index):
+        z0, rho_vec, _, _ = carry
+        step_index = chunk_index * chunk_steps + jnp.arange(chunk_steps)
+        valid = step_index < last_step
+        t = tau[0] + (step_index + 0.5) * dt
+        u = synthesize_composite_waveform(
+            composite=pulse,
+            tau=t,
+            at_time=pulse_center,
+            dphase=0.0,
+            all_info=False,
+            dt=sample_period,
+        ).astype(dtype)
+
+        # z_{k+1} = decay * z_k + (1 - decay) * u_k, as a parallel prefix.
+        a_cum, b_cum = jax.lax.associative_scan(
+            affine_compose,
+            (jnp.full_like(u, decay), (1.0 - decay) * u),
+        )
+        z_after = a_cum * z0 + b_cum
+        z_before = jnp.concatenate([z0[None], z_after[:-1]])
+        z_average = u + (z_before - u) * average_weight
+
+        L = L0[None] + z_average[:, None, None] * Lb[None]
+        propagators = jax.vmap(lambda matrix: jax.scipy.linalg.expm(matrix * dt))(L)
+        propagators = jnp.where(valid[:, None, None], propagators, identity)
+        cumulative = jax.lax.associative_scan(
+            lambda first, second: second @ first, propagators
+        )
+        rho_steps = jnp.einsum("kij,j->ki", cumulative, rho_vec)
+
+        rho_seq = jnp.concatenate([rho_vec[None], rho_steps[sample_ends]])
+        z_seq = jnp.concatenate([z0[None], z_after[sample_ends]])
+        # Samples of this chunk that lie inside the pulse (>= 1).
+        n_valid = jnp.clip(num_intervals - chunk_index * chunk_size, 1, chunk_size)
+        new_carry = (
+            z_seq[n_valid],
+            rho_seq[n_valid],
+            z_seq[n_valid - 1],
+            rho_seq[n_valid - 1],
+        )
+        saved = None if saveat_final_only else (rho_seq[1:], z_seq[1:])
+        return new_carry, saved
+
+    carry0 = (z_start, rho0_vec, z_start, rho0_vec)
+    carry, saved = jax.lax.scan(
+        jax.checkpoint(chunk), carry0, jnp.arange(num_chunks)
+    )
+    if saveat_final_only:
+        z_last, rho_last, z_prev, rho_prev = carry
+        rho_all = jnp.stack([rho_prev, rho_last])
+        z_all = jnp.stack([z_prev, z_last])
+    else:
+        rho_saved, z_saved = saved
+        rho_all = jnp.concatenate(
+            [rho0_vec[None], rho_saved.reshape(-1, dimension**2)[:num_intervals]]
+        )
+        z_all = jnp.concatenate([z_start[None], z_saved.reshape(-1)[:num_intervals]])
+
+    rho_all = rho_all.reshape(-1, dimension, dimension)
+    populations = jnp.real(jnp.diagonal(rho_all, axis1=-2, axis2=-1)).T
+    states = jqt.Qarray.create(rho_all, dims=(dimension,))
+    return states, (None, z_all), populations
 
 
 @partial(
@@ -1443,8 +1832,8 @@ def _assign_rotating_frame_shifts(
         detuning, so no time-independent rotating frame exists. The message
         lists every edge of the offending loop.
     """
-    driven = np.asarray(driven)
-    selected_frequency = np.asarray(selected_frequency)
+    driven = jnp.asarray(driven)
+    selected_frequency = jnp.asarray(selected_frequency)
 
     edges_from_ground = [[] for _ in range(num_ground)]
     edges_from_excited = [[] for _ in range(num_excited)]
@@ -1487,11 +1876,83 @@ def _assign_rotating_frame_shifts(
                         )
                     )
 
-    shift_ground = np.asarray([shift.get(("g", g), 0.0) for g in range(num_ground)])
-    shift_excited = np.asarray(
+    shift_ground = jnp.asarray([shift.get(("g", g), 0.0) for g in range(num_ground)])
+    shift_excited = jnp.asarray(
         [shift.get(("e", e), 0.0) for e in range(num_excited)]
     )
     return shift_ground, shift_excited
+
+
+def _propagate_rotating_frame_shifts(driven, selected_frequency):
+    """Traceable (jit/vmap-safe) version of :func:`_assign_rotating_frame_shifts`.
+
+    Each connected component of the drive graph is rooted at its
+    lowest-index ground level (the same root the breadth-first search in
+    :func:`_assign_rotating_frame_shifts` uses), and shifts are propagated
+    outward one graph layer per step. Instead of raising on an inconsistent
+    loop, the largest residual over all driven pairs is returned so the
+    caller can decide how to report it.
+
+    Parameters
+    ----------
+    driven : array_like, shape (num_excited, num_ground), bool
+        Which ground-excited pairs are driven.
+    selected_frequency : array_like, shape (num_excited, num_ground)
+        Absolute frequency, in GHz, of the line driving each driven pair.
+
+    Returns
+    -------
+    shift_ground, shift_excited : jax.Array
+        Per-level frequency shifts, in GHz, as in
+        :func:`_assign_rotating_frame_shifts`.
+    loop_mismatch : jax.Array, scalar
+        Largest ``|shift_excited[e] - shift_ground[g] - selected_frequency[e, g]|``
+        over driven pairs; nonzero only for a frequency-inconsistent loop.
+    """
+    driven = jnp.asarray(driven, dtype=bool)
+    selected_frequency = jnp.asarray(selected_frequency)
+    num_excited, num_ground = driven.shape
+
+    # Ground levels sharing an excited level are neighbors; the transitive
+    # closure gives each ground level's component, rooted at its lowest index.
+    ground_adjacency = (driven.T.astype(jnp.int32) @ driven.astype(jnp.int32)) > 0
+    reachable = ground_adjacency | jnp.eye(num_ground, dtype=bool)
+    for _ in range(num_ground):
+        reachable = reachable | (
+            (reachable.astype(jnp.int32) @ reachable.astype(jnp.int32)) > 0
+        )
+    assigned_ground = jnp.argmax(reachable, axis=1) == jnp.arange(num_ground)
+    assigned_excited = jnp.zeros((num_excited,), dtype=bool)
+    shift_ground = jnp.zeros((num_ground,), dtype=selected_frequency.dtype)
+    shift_excited = jnp.zeros((num_excited,), dtype=selected_frequency.dtype)
+
+    # A breadth-first tree has depth below num_ground + num_excited.
+    excited_index = jnp.arange(num_excited)
+    ground_index = jnp.arange(num_ground)
+    for _ in range(num_ground + num_excited):
+        from_ground = driven & assigned_ground[None, :]
+        g = jnp.argmax(from_ground, axis=1)
+        update = ~assigned_excited & jnp.any(from_ground, axis=1)
+        shift_excited = jnp.where(
+            update,
+            shift_ground[g] + selected_frequency[excited_index, g],
+            shift_excited,
+        )
+        assigned_excited = assigned_excited | update
+
+        from_excited = driven & assigned_excited[:, None]
+        e = jnp.argmax(from_excited, axis=0)
+        update = ~assigned_ground & jnp.any(from_excited, axis=0)
+        shift_ground = jnp.where(
+            update,
+            shift_excited[e] - selected_frequency[e, ground_index],
+            shift_ground,
+        )
+        assigned_ground = assigned_ground | update
+
+    residual = shift_excited[:, None] - shift_ground[None, :] - selected_frequency
+    loop_mismatch = jnp.max(jnp.where(driven, jnp.abs(residual), 0.0))
+    return shift_ground, shift_excited, loop_mismatch
 
 
 def _describe_inconsistent_loop(parent, node, neighbor, mismatch, edge_labels):
@@ -1628,6 +2089,213 @@ def get_density_matrix_trajectory(L, rho0):
     return rho_t
 
 
+def get_binned_density_matrix_evolution(L, rho0, bin_widths, state_time=None, max_squarings=64):
+    """Bin-averaged rho(t), and rho at one time, from a static Liouvillian.
+
+    Differentiable counterpart of :func:`get_density_matrix_trajectory`:
+    instead of diagonalizing `L` (whose eigenvector derivatives are NaN for
+    the degenerate spectra typical of a Liouvillian), every quantity is a
+    matrix exponential. For a bin of width ``w``, one exponential of the
+    block matrix ``[[L, I], [0, 0]] * w`` yields both the propagator
+    ``exp(L w)`` and the exact integral ``int_0^w exp(L s) ds`` (Van Loan),
+    and the bins are stepped through with ``lax.scan``. Nothing of size
+    ``(n_samples, d, d)`` is ever materialized.
+
+    Parameters
+    ----------
+    L : jax.Array, shape (d**2, d**2)
+        Vectorized (row-major) Liouvillian, in 1/s.
+    rho0 : array-like, shape (d, d)
+        Density matrix at the start of the first bin.
+    bin_widths : array_like, shape (n_bins,)
+        Contiguous bin widths, in seconds, the first bin starting at t = 0.
+        Must be concrete (not traced): the distinct widths are found on the
+        host so each needs only one exponential.
+    state_time : scalar, optional
+        Time, in seconds, at which to also return rho. May be traced, and
+        rho is differentiable with respect to it. Defaults to the end of
+        the last bin.
+    max_squarings : int
+        Passed to :func:`jax.scipy.linalg.expm`. The rotating-frame
+        Hamiltonian keeps level energies of order 1e2-1e5 GHz, so
+        ``|L| * t`` is large and needs more squarings than JAX's default.
+
+    Returns
+    -------
+    rho_state : jax.Array, shape (d, d)
+        Density matrix at `state_time`.
+    rho_bin_average : jax.Array, shape (n_bins, d, d)
+        Time average of rho over each bin.
+    """
+    dim = int(round(L.shape[0] ** 0.5))
+    n = L.shape[0]
+    bin_widths = np.asarray(bin_widths, dtype=float)
+    unique_widths, bin_to_width = np.unique(bin_widths, return_inverse=True)
+    rho0_vec = jnp.asarray(rho0).reshape(-1).astype(L.dtype)
+
+    def propagator_and_integral(width):
+        block = (
+            jnp.zeros((2 * n, 2 * n), dtype=L.dtype)
+            .at[:n, :n].set(L * width)
+            .at[:n, n:].set(jnp.eye(n, dtype=L.dtype) * width)
+        )
+        exp_block = jax.scipy.linalg.expm(block, max_squarings=max_squarings)
+        return exp_block[:n, :n], exp_block[:n, n:] / width
+
+    propagators, averagers = jax.vmap(propagator_and_integral)(
+        jnp.asarray(unique_widths, dtype=L.dtype)
+    )
+
+    def step(rho_vec, k):
+        return propagators[k] @ rho_vec, averagers[k] @ rho_vec
+
+    _, bin_average_vec = jax.lax.scan(step, rho0_vec, jnp.asarray(bin_to_width))
+
+    if state_time is None:
+        state_time = float(bin_widths.sum())
+    state_time = jnp.asarray(state_time, dtype=L.dtype)
+    rho_state_vec = (
+        jax.scipy.linalg.expm(L * state_time, max_squarings=max_squarings) @ rho0_vec
+    )
+    return rho_state_vec.reshape(dim, dim), bin_average_vec.reshape(-1, dim, dim)
+
+
+def _multitone_liouvillian(
+    particle: SnVParticle,
+    control_state: SnVControlState,
+    eom_freqs,
+    eom_amplitudes,
+    included_states,
+    max_bessel_order: int,
+    bessel_series_terms: int,
+    max_detuning,
+):
+    """Build the static rotating-frame Liouvillian of :func:`multitone_optical_drive`.
+
+    Shared by :func:`multitone_optical_drive` and
+    :func:`multitone_optical_drive_binned`; see the former for the physics
+    and the meaning of every argument.
+
+    Returns
+    -------
+    L : jax.Array, shape (dimension**2, dimension**2)
+        Row-major vectorized Liouvillian, in 1/s.
+    inconsistent : jax.Array, scalar bool
+        Whether the selected drive graph has a loop with nonzero net loop
+        detuning (only returned when traced; raised eagerly).
+    """
+    included_states = tuple(included_states)
+    d, n = particle.diffable, particle.nondiff
+
+    eom_freqs = jnp.atleast_1d(jnp.asarray(eom_freqs))
+    eom_amplitudes = jnp.atleast_1d(jnp.asarray(eom_amplitudes))
+    if eom_freqs.ndim != 1 or eom_freqs.shape != eom_amplitudes.shape:
+        raise ValueError(
+            "`eom_freqs` and `eom_amplitudes` must be one-dimensional arrays "
+            "of the same length."
+        )
+
+    (
+        E_gnd,
+        _,
+        _,
+        _,
+        E_exc,
+        _,
+        _,
+        _,
+        transition_coupling_squared,
+        _,
+    ) = PLE_transitions(particle, control_state)
+    ple_freqs = (
+        E_exc[:, None] - E_gnd[None, :] + params.LEVEL_OFFSET + d.strain_params[0]
+    )
+
+    state_index = jnp.asarray(included_states, dtype=jnp.int32)
+    reduced_ple_freqs = ple_freqs[jnp.ix_(state_index, state_index)]
+    reduced_coupling_squared = transition_coupling_squared[
+        jnp.ix_(state_index, state_index)
+    ]
+
+    selected_weight, selected_frequency, driven, selected_orders = _select_multitone_sidebands(
+        reduced_coupling_squared,
+        reduced_ple_freqs,
+        eom_freqs,
+        eom_amplitudes,
+        n.laser_frequency,
+        d.eom_vpi_ratio,
+        d.eom_vpi_bandwidth,
+        n.excited_state_lifetime,
+        max_bessel_order,
+        bessel_series_terms,
+        max_detuning,
+    )
+
+    reduced_dim = len(included_states)
+    shift_ground, shift_excited, loop_mismatch = _propagate_rotating_frame_shifts(
+        driven, selected_frequency
+    )
+    inconsistent = loop_mismatch > 1e-6
+    try:
+        raise_inconsistent = bool(inconsistent)
+    except jax.errors.ConcretizationTypeError:
+        # Traced (jit/vmap/grad): cannot raise, so NaN-fill the outputs below.
+        raise_inconsistent = False
+    if raise_inconsistent:
+        # Rerun the host-side search only to build the detailed error message.
+        line_offset = np.asarray(selected_frequency - n.laser_frequency)
+        line_detuning = np.asarray(selected_frequency - reduced_ple_freqs)
+        orders = np.asarray(selected_orders)
+        edge_labels = [
+            [
+                f"line = laser {line_offset[e, g]:+.6f} GHz, mixing orders "
+                f"{tuple(int(k) for k in orders[e, g])}, transition detuning "
+                f"{line_detuning[e, g]:+.6f} GHz"
+                for g in range(reduced_dim)
+            ]
+            for e in range(reduced_dim)
+        ]
+        _assign_rotating_frame_shifts(
+            driven, selected_frequency, reduced_dim, reduced_dim, edge_labels
+        )
+
+    _, _, Hs_optical, c_ops, _ = get_excitation_hamiltonian(
+        particle, control_state, included_states=included_states
+    )
+    dimension = 2 * reduced_dim + 1
+
+    p_ge_block = Hs_optical[1].to_dense().data[
+        reduced_dim : 2 * reduced_dim, 0:reduced_dim
+    ]
+    dtype = p_ge_block.dtype
+    coupling_block = jnp.asarray(selected_weight, dtype=dtype) * p_ge_block
+
+    E_gnd_reduced = E_gnd[state_index]
+    E_exc_reduced = E_exc[state_index] + params.LEVEL_OFFSET + d.strain_params[0]
+    diagonal = jnp.concatenate(
+        [
+            E_gnd_reduced - jnp.asarray(shift_ground, dtype=E_gnd_reduced.dtype),
+            E_exc_reduced - jnp.asarray(shift_excited, dtype=E_exc_reduced.dtype),
+            jnp.zeros((1,), dtype=E_gnd_reduced.dtype),
+        ]
+    ).astype(dtype)
+
+    H_eff = (
+        jnp.zeros((dimension, dimension), dtype=dtype)
+        .at[jnp.diag_indices(dimension)]
+        .set(diagonal)
+        .at[reduced_dim : 2 * reduced_dim, 0:reduced_dim]
+        .set(coupling_block)
+        .at[0:reduced_dim, reduced_dim : 2 * reduced_dim]
+        .set(jnp.conj(coupling_block).T)
+    )
+    H_eff = jqt.Qarray.create(H_eff, dims=(dimension,))
+
+    scale = 1e9
+    L = get_multitone_liouvillian(2.0 * jnp.pi * H_eff * scale, c_ops * jnp.sqrt(scale))
+    return L, inconsistent
+
+
 def multitone_optical_drive(
     particle: SnVParticle,
     control_state: SnVControlState,
@@ -1696,114 +2364,278 @@ def multitone_optical_drive(
         Density matrix at every time in ``tlist``.
     populations : jax.Array, shape (dimension, len(tlist))
         Real basis populations at every time in ``tlist``.
+
+    Raises
+    ------
+    ValueError
+        Called eagerly, if the selected drive graph has a loop with nonzero
+        net loop detuning (see :func:`_assign_rotating_frame_shifts`). Under
+        ``jax.jit``/``jax.vmap`` the error cannot be raised, so both outputs
+        are NaN-filled for that (batch element's) drive instead.
+
+    Notes
+    -----
+    The function is traceable, so it can be wrapped in ``jax.jit`` and
+    ``jax.vmap`` (e.g. over particles and/or control states), with
+    ``included_states``, ``max_bessel_order`` and ``bessel_series_terms``
+    static and the number of EOM tones fixed across the batch.
+
+    It is not reverse/forward differentiable: the eigendecomposition in
+    :func:`get_density_matrix_trajectory` has NaN eigenvector derivatives
+    for degenerate Liouvillian spectra. Use
+    :func:`multitone_optical_drive_binned` under ``jax.grad``.
     """
-    included_states = tuple(included_states)
-    d, n = particle.diffable, particle.nondiff
-
-    eom_freqs = jnp.atleast_1d(jnp.asarray(eom_freqs))
-    eom_amplitudes = jnp.atleast_1d(jnp.asarray(eom_amplitudes))
-    if eom_freqs.ndim != 1 or eom_freqs.shape != eom_amplitudes.shape:
-        raise ValueError(
-            "`eom_freqs` and `eom_amplitudes` must be one-dimensional arrays "
-            "of the same length."
-        )
-    tlist = jnp.asarray(tlist)
-
-    (
-        E_gnd,
-        _,
-        _,
-        _,
-        E_exc,
-        _,
-        _,
-        _,
-        transition_coupling_squared,
-        _,
-    ) = PLE_transitions(particle, control_state)
-    ple_freqs = (
-        E_exc[:, None] - E_gnd[None, :] + params.LEVEL_OFFSET + d.strain_params[0]
-    )
-
-    state_index = jnp.asarray(included_states, dtype=jnp.int32)
-    reduced_ple_freqs = ple_freqs[jnp.ix_(state_index, state_index)]
-    reduced_coupling_squared = transition_coupling_squared[
-        jnp.ix_(state_index, state_index)
-    ]
-
-    selected_weight, selected_frequency, driven, selected_orders = _select_multitone_sidebands(
-        reduced_coupling_squared,
-        reduced_ple_freqs,
+    L, inconsistent = _multitone_liouvillian(
+        particle,
+        control_state,
         eom_freqs,
         eom_amplitudes,
-        n.laser_frequency,
-        d.eom_vpi_ratio,
-        d.eom_vpi_bandwidth,
-        n.excited_state_lifetime,
+        tuple(included_states),
         max_bessel_order,
         bessel_series_terms,
         max_detuning,
     )
-
-    reduced_dim = len(included_states)
-    line_offset = np.asarray(selected_frequency - n.laser_frequency)
-    line_detuning = np.asarray(selected_frequency - reduced_ple_freqs)
-    orders = np.asarray(selected_orders)
-    edge_labels = [
-        [
-            f"line = laser {line_offset[e, g]:+.6f} GHz, mixing orders "
-            f"{tuple(int(k) for k in orders[e, g])}, transition detuning "
-            f"{line_detuning[e, g]:+.6f} GHz"
-            for g in range(reduced_dim)
-        ]
-        for e in range(reduced_dim)
-    ]
-    shift_ground, shift_excited = _assign_rotating_frame_shifts(
-        driven, selected_frequency, reduced_dim, reduced_dim, edge_labels
-    )
-
-    _, _, Hs_optical, c_ops, _ = get_excitation_hamiltonian(
-        particle, control_state, included_states=included_states
-    )
-    dimension = 2 * reduced_dim + 1
-
-    p_ge_block = Hs_optical[1].to_dense().data[
-        reduced_dim : 2 * reduced_dim, 0:reduced_dim
-    ]
-    dtype = p_ge_block.dtype
-    coupling_block = jnp.asarray(selected_weight, dtype=dtype) * p_ge_block
-
-    E_gnd_reduced = E_gnd[state_index]
-    E_exc_reduced = E_exc[state_index] + params.LEVEL_OFFSET + d.strain_params[0]
-    diagonal = jnp.concatenate(
-        [
-            E_gnd_reduced - jnp.asarray(shift_ground, dtype=E_gnd_reduced.dtype),
-            E_exc_reduced - jnp.asarray(shift_excited, dtype=E_exc_reduced.dtype),
-            jnp.zeros((1,), dtype=E_gnd_reduced.dtype),
-        ]
-    ).astype(dtype)
-
-    H_eff = (
-        jnp.zeros((dimension, dimension), dtype=dtype)
-        .at[jnp.diag_indices(dimension)]
-        .set(diagonal)
-        .at[reduced_dim : 2 * reduced_dim, 0:reduced_dim]
-        .set(coupling_block)
-        .at[0:reduced_dim, reduced_dim : 2 * reduced_dim]
-        .set(jnp.conj(coupling_block).T)
-    )
-    H_eff = jqt.Qarray.create(H_eff, dims=(dimension,))
-
-    scale = 1e9
-    L = get_multitone_liouvillian(2.0 * jnp.pi * H_eff * scale, c_ops * jnp.sqrt(scale))
+    dimension = 2 * len(included_states) + 1
     rho_t = get_density_matrix_trajectory(L, _to_dense(rho0))
-    rho_trajectory = jnp.reshape(rho_t(tlist), (-1, dimension, dimension))
+    rho_trajectory = jnp.reshape(rho_t(jnp.asarray(tlist)), (-1, dimension, dimension))
     populations = jnp.real(
         jnp.diagonal(rho_trajectory, axis1=-2, axis2=-1)
     ).T
+    rho_trajectory = jnp.where(inconsistent, jnp.nan, rho_trajectory)
+    populations = jnp.where(inconsistent, jnp.nan, populations)
     return rho_trajectory, populations
 
 
+def multitone_optical_drive_binned(
+    particle: SnVParticle,
+    control_state: SnVControlState,
+    rho0,
+    eom_freqs,
+    eom_amplitudes,
+    bin_widths,
+    state_time=None,
+    included_states=(0, 1, 2, 3),
+    max_bessel_order: int = 3,
+    bessel_series_terms: int = 48,
+    max_detuning=jnp.inf,
+):
+    """Bin-averaged version of :func:`multitone_optical_drive`.
+
+    Same physics and rotating frame as :func:`multitone_optical_drive`, but
+    evolved with :func:`get_binned_density_matrix_evolution` rather than an
+    eigendecomposition, so it is differentiable (``jax.grad``) as well as
+    ``jax.jit``/``jax.vmap``-compatible, and its memory does not scale with
+    the number of time samples.
+
+    Parameters
+    ----------
+    particle, control_state, rho0, eom_freqs, eom_amplitudes
+        As in :func:`multitone_optical_drive`.
+    bin_widths : array_like, shape (n_bins,)
+        Concrete contiguous bin widths, in seconds, starting at t = 0.
+    state_time : scalar, optional
+        Time, in seconds, at which to return the density matrix; may be
+        traced. Defaults to the end of the last bin.
+    included_states, max_bessel_order, bessel_series_terms, max_detuning
+        As in :func:`multitone_optical_drive`.
+
+    Returns
+    -------
+    rho_state : jax.Array, shape (dimension, dimension)
+        Density matrix at `state_time`.
+    bin_populations : jax.Array, shape (dimension, n_bins)
+        Real basis populations averaged over each bin.
+
+    Notes
+    -----
+    Gradients are those of the drive graph selected at the current
+    parameters: the sideband selection (``argmax``) and the ``max_detuning``
+    cut are piecewise constant, so outputs can jump where the selection
+    changes. NaN-filling of inconsistent loops is as in
+    :func:`multitone_optical_drive`.
+    """
+    L, inconsistent = _multitone_liouvillian(
+        particle,
+        control_state,
+        eom_freqs,
+        eom_amplitudes,
+        tuple(included_states),
+        max_bessel_order,
+        bessel_series_terms,
+        max_detuning,
+    )
+    rho_state, rho_bin_average = get_binned_density_matrix_evolution(
+        L, _to_dense(rho0), bin_widths, state_time
+    )
+    bin_populations = jnp.real(
+        jnp.diagonal(rho_bin_average, axis1=-2, axis2=-1)
+    ).T
+    rho_state = jnp.where(inconsistent, jnp.nan, rho_state)
+    bin_populations = jnp.where(inconsistent, jnp.nan, bin_populations)
+    return rho_state, bin_populations
+
+######################################################
+#### Helpers for gradients
+######################################################
+PyTree = Any
+JacobianMode = Literal["fwd", "rev"]
+
+def stop_gradient_tree(tree: PyTree) -> PyTree:
+    """Apply ``stop_gradient`` to every pytree leaf."""
+    return jax.tree_util.tree_map(jax.lax.stop_gradient, tree)
+
+
+def diffable_form(
+    helper: Callable[[SnVParticle, SnVControlState], PyTree],
+) -> Callable[[SnVDifferentiableParams, SnVNonDiffParams, SnVControlState], PyTree]:
+    """Expose the differentiable subtree as a helper's first argument."""
+
+    def helper_from_diffable(diffable, nondiff, control_state):
+        return helper(SnVParticle(diffable, nondiff), control_state)
+
+    return helper_from_diffable
+
+
+ParticleHelper = Callable[[SnVParticle, SnVControlState], PyTree]
+ParticleLoss = Callable[[SnVParticle, SnVControlState], Array]
+
+
+def make_batched_helper(helper: ParticleHelper) -> Callable:
+    """Vectorize a helper over particles under one shared control state."""
+    return jax.jit(jax.vmap(helper, in_axes=(0, None), out_axes=0))
+
+
+def make_batched_helper_with_particle_controls(helper: ParticleHelper) -> Callable:
+    """Vectorize a helper over matched particle and control batches."""
+    return jax.jit(jax.vmap(helper, in_axes=(0, 0), out_axes=0))
+
+
+def make_single_particle_jacobian(
+    helper: ParticleHelper, *, mode: JacobianMode = "rev"
+) -> Callable:
+    """Differentiate one helper with respect to ``SnVDifferentiableParams``."""
+    transformed = diffable_form(helper)
+    if mode == "rev":
+        jacobian = jax.jacrev(transformed, argnums=0)
+    elif mode == "fwd":
+        jacobian = jax.jacfwd(transformed, argnums=0)
+    else:
+        raise ValueError("`mode` must be 'fwd' or 'rev'.")
+    return jax.jit(jacobian)
+
+
+def make_batched_particle_jacobian(
+    helper: ParticleHelper, *, mode: JacobianMode = "rev"
+) -> Callable:
+    """Return one independent parameter Jacobian per particle."""
+    transformed = diffable_form(helper)
+    if mode == "rev":
+        jacobian_one = jax.jacrev(transformed, argnums=0)
+    elif mode == "fwd":
+        jacobian_one = jax.jacfwd(transformed, argnums=0)
+    else:
+        raise ValueError("`mode` must be 'fwd' or 'rev'.")
+    return jax.jit(jax.vmap(jacobian_one, in_axes=(0, 0, None), out_axes=0))
+
+
+def make_single_control_jacobian(
+    helper: ParticleHelper, *, mode: JacobianMode = "rev"
+) -> Callable:
+    """Differentiate one helper with respect to its control state."""
+    if mode == "rev":
+        jacobian = jax.jacrev(helper, argnums=1)
+    elif mode == "fwd":
+        jacobian = jax.jacfwd(helper, argnums=1)
+    else:
+        raise ValueError("`mode` must be 'fwd' or 'rev'.")
+    return jax.jit(jacobian)
+
+
+def make_batched_control_jacobian(
+    helper: ParticleHelper, *, mode: JacobianMode = "rev"
+) -> Callable:
+    """Return one independent control Jacobian per particle, under one shared
+    control state."""
+    if mode == "rev":
+        jacobian_one = jax.jacrev(helper, argnums=1)
+    elif mode == "fwd":
+        jacobian_one = jax.jacfwd(helper, argnums=1)
+    else:
+        raise ValueError("`mode` must be 'fwd' or 'rev'.")
+    return jax.jit(jax.vmap(jacobian_one, in_axes=(0, None), out_axes=0))
+
+
+def make_batched_control_jacobian_with_particle_controls(
+    helper: ParticleHelper, *, mode: JacobianMode = "rev"
+) -> Callable:
+    """Return one independent control Jacobian per matched particle/control pair."""
+    if mode == "rev":
+        jacobian_one = jax.jacrev(helper, argnums=1)
+    elif mode == "fwd":
+        jacobian_one = jax.jacfwd(helper, argnums=1)
+    else:
+        raise ValueError("`mode` must be 'fwd' or 'rev'.")
+    return jax.jit(jax.vmap(jacobian_one, in_axes=(0, 0), out_axes=0))
+
+
+def make_batched_particle_value_and_grad(loss: ParticleLoss) -> Callable:
+    """Return one real scalar loss and parameter gradient per particle."""
+    value_and_grad_one = jax.value_and_grad(diffable_form(loss), argnums=0)
+    return jax.jit(
+        jax.vmap(value_and_grad_one, in_axes=(0, 0, None), out_axes=(0, 0))
+    )
+
+
+def make_weighted_distribution_value_and_grad(loss: ParticleLoss) -> Callable:
+    """Differentiate a weighted loss with respect to all particle parameters."""
+    loss_batch = jax.vmap(loss, in_axes=(0, None), out_axes=0)
+
+    def objective(diffable, nondiff, weights, control_state):
+        losses = loss_batch(SnVParticle(diffable, nondiff), control_state)
+        weights = weights / jnp.sum(weights)
+        return jnp.sum(weights * losses)
+
+    return jax.jit(jax.value_and_grad(objective, argnums=0))
+
+
+def make_particle_control_value_and_grad(loss: ParticleLoss) -> Callable:
+    """Differentiate one particle's scalar loss with respect to its control state."""
+    return jax.jit(jax.value_and_grad(loss, argnums=1))
+
+
+def make_weighted_control_value_and_grad(loss: ParticleLoss) -> Callable:
+    """Differentiate a weighted particle loss with respect to shared controls."""
+    loss_batch = jax.vmap(loss, in_axes=(0, None), out_axes=0)
+
+    def objective(particles, weights, control_state):
+        weights = weights / jnp.sum(weights)
+        return jnp.sum(weights * loss_batch(particles, control_state))
+
+    return jax.jit(jax.value_and_grad(objective, argnums=2))
+
+
+def example_vector_helper(
+    particle: SnVParticle, control_state: SnVControlState
+) -> Array:
+    """Small vector-valued example using both parameter subtrees."""
+    d, n = particle.diffable, particle.nondiff
+    factors = jnp.asarray([1.0, -1.0, 0.5, -0.5], dtype=d.strain_params.dtype)
+    return jnp.stack(
+        [
+            jnp.sum(d.magnet_unit_magnitude * control_state.magnet_settings),
+            d.strain_params[0]
+            + factors[n.dipole_crystal_axis_idx] * d.strain_params[1],
+        ]
+    )
+
+
+def example_scalar_loss(
+    particle: SnVParticle, control_state: SnVControlState
+) -> Array:
+    """Real scalar example suitable for gradient transformations."""
+    return jnp.sum(example_vector_helper(particle, control_state) ** 2)
+
+# TODO - Update for actual __all__
 __all__ = [
     "lowpass_filter",
     "eom_lowpass_filter",
@@ -1813,7 +2645,6 @@ __all__ = [
     "get_magnet_axes",
     "get_B_settings",
     "get_waveplate_angles",
-    "get_optimal_control_state",
     "get_B_cartesian",
     "get_B_spherical",
     "get_dipole_B_GHz",
@@ -1830,8 +2661,13 @@ __all__ = [
     "get_excitation_hamiltonian",
     "get_ground_hamiltonian",
     "drive_mw_hamiltonian",
+    "drive_mw_hamiltonian_mixed",
+    "expand_excited_rho",
+    "collapse_excited_rho",
     "drive_excitation_hamiltonian",
     "get_multitone_liouvillian",
     "get_density_matrix_trajectory",
+    "get_binned_density_matrix_evolution",
     "multitone_optical_drive",
+    "multitone_optical_drive_binned",
 ]
