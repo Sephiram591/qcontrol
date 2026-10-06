@@ -195,6 +195,33 @@ def _dense_data(operator: jqt.Qarray) -> jax.Array:
     return operator.to_dense().data
 
 
+def _jump_amplitude(rate: Any) -> jax.Array:
+    """Return ``sqrt(rate)`` with a zero, rather than NaN, derivative at 0.
+
+    Parameters
+    ----------
+    rate : array_like
+        Non-negative decay rate.
+
+    Returns
+    -------
+    jax.Array
+        Lindblad jump amplitude ``sqrt(rate)``; zero where ``rate <= 0``.
+
+    Notes
+    -----
+    Some rates are exactly zero by construction (e.g. emission into the
+    upper ground orbital, folded away in
+    :func:`_calculate_folded_branching_ratios`). There ``jnp.sqrt`` has an
+    infinite derivative, and ``inf * 0`` makes every gradient that passes
+    through the collapse operators NaN. A dissipator depends only on the
+    squared amplitude, i.e. on ``rate``, whose derivative at a zero minimum
+    is zero, so the zero derivative used here is exact.
+    """
+    positive = rate > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, rate, 1.0)), 0.0)
+
+
 def _state_matrix(eigenstates: jqt.Qarray) -> jax.Array:
     """Convert batched ket eigenstates to a row-oriented state matrix.
 
@@ -3329,7 +3356,7 @@ def get_dynamic_hamiltonian(
                     total_decay_rate
                     * branching_ratios[excited_index, ground_index]
                 )
-                jump_ge = jnp.sqrt(jump_rate) * jump_base
+                jump_ge = _jump_amplitude(jump_rate) * jump_base
                 c_ops_list.append(
                     jqt.Qarray.create(
                         _offdiagonal_data(zero_base, jump_ge),
@@ -3442,7 +3469,7 @@ def get_dynamic_hamiltonian(
                 jump_operator = zero_reduced_full.at[
                     target_index,
                     source_index,
-                ].set(jnp.sqrt(jump_rate))
+                ].set(_jump_amplitude(jump_rate))
                 c_ops_list.append(
                     jqt.Qarray.create(jump_operator, dims=reduced_dims)
                 )
